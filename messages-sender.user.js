@@ -2,11 +2,13 @@
 // @name         Messages Sender
 // @namespace    http://tampermonkey.net/
 // @version      4.2
-// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Prevents duplicate sends. Fully event-driven — zero wasted time. Paired mode with direct Google Sheets paste support.
+// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Prevents duplicate sends. Fully event-driven — zero wasted time.
 // @author       You
 // @match        https://messages.google.com/*
 // @grant        none
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
+// @updateURL    https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
 // ==/UserScript==
 (() => {
   'use strict';
@@ -19,16 +21,9 @@
   const NUMS_ID        = '__gm_batch_numbers';
   const MSG_ID         = '__gm_batch_message';
   const STATUS_ID      = '__gm_batch_status';
-  const PAIRED_ID      = '__gm_batch_paired';
-  const TAB_BATCH_ID   = '__gm_tab_batch';
-  const TAB_PAIRED_ID  = '__gm_tab_paired';
-  const VIEW_BATCH_ID  = '__gm_view_batch';
-  const VIEW_PAIRED_ID = '__gm_view_paired';
-  const PREVIEW_ID     = '__gm_batch_preview';
 
   let stopRequested  = false;
   let waitingForNext = false;
-  let activeMode     = 'batch'; // 'batch' or 'paired'
 
   const sentNumbers = new Set();
 
@@ -114,7 +109,7 @@
   const setVal = (el, val) => {
     if (!el) return;
     const nativeInputValueSetter    = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const nativeTextAreaValueSetter  = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+    const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
     if (el.tagName === 'TEXTAREA' && nativeTextAreaValueSetter) {
       nativeTextAreaValueSetter.call(el, val);
     } else if (el.tagName === 'INPUT' && nativeInputValueSetter) {
@@ -247,75 +242,11 @@
       #${START_BTN_ID}, #${STOP_BTN_ID}, #${NEXT_BTN_ID} {
         transition: all 0.2s ease;
       }
-      .__gm_tab {
-        flex: 1;
-        padding: 9px 0;
-        background: transparent;
-        color: ${T.textMuted};
-        border: none;
-        border-bottom: 2px solid transparent;
-        cursor: pointer;
-        font-weight: 600;
-        font-size: 10px;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        transition: all 0.2s ease;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      }
-      .__gm_tab:hover {
-        color: ${T.textBody};
-      }
-      .__gm_tab.__gm_tab_active {
-        color: ${T.gold};
-        border-bottom-color: ${T.gold};
-      }
-      #${PREVIEW_ID} {
-        margin-top: 8px;
-        max-height: 80px;
-        overflow-y: auto;
-        font-size: 10px;
-        font-family: Monaco, "Courier New", monospace;
-        color: ${T.textMuted};
-        padding: 8px 10px;
-        background: ${T.pageBg};
-        border-radius: 6px;
-        border: 1px solid ${T.border};
-        line-height: 1.5;
-      }
-      #${PREVIEW_ID} .pair-row {
-        display: flex;
-        gap: 6px;
-        padding: 2px 0;
-      }
-      #${PREVIEW_ID} .pair-num {
-        color: ${T.textBody};
-        flex-shrink: 0;
-        min-width: 75px;
-      }
-      #${PREVIEW_ID} .pair-arrow {
-        color: ${T.gold};
-        flex-shrink: 0;
-      }
-      #${PREVIEW_ID} .pair-msg {
-        color: ${T.textMuted};
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
       /* Scrollbar styling */
-      #${PANEL_ID} ::-webkit-scrollbar {
-        width: 4px;
-      }
-      #${PANEL_ID} ::-webkit-scrollbar-track {
-        background: transparent;
-      }
-      #${PANEL_ID} ::-webkit-scrollbar-thumb {
-        background: ${T.border};
-        border-radius: 4px;
-      }
-      #${PANEL_ID} ::-webkit-scrollbar-thumb:hover {
-        background: ${T.textMuted};
-      }
+      #${PANEL_ID} ::-webkit-scrollbar { width: 4px; }
+      #${PANEL_ID} ::-webkit-scrollbar-track { background: transparent; }
+      #${PANEL_ID} ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
+      #${PANEL_ID} ::-webkit-scrollbar-thumb:hover { background: ${T.textMuted}; }
     `;
     document.head.appendChild(style);
 
@@ -348,33 +279,7 @@
       letterSpacing:  '-0.01em',
     });
 
-    /* ---- Tabs ---- */
-    const tabRow = document.createElement('div');
-    Object.assign(tabRow.style, {
-      display:      'flex',
-      gap:          '0',
-      marginBottom: '14px',
-      borderBottom: `1px solid ${T.border}`,
-    });
-
-    const tabBatch = document.createElement('button');
-    tabBatch.id = TAB_BATCH_ID;
-    tabBatch.className = '__gm_tab __gm_tab_active';
-    tabBatch.textContent = 'Same Message';
-    tabBatch.type = 'button';
-
-    const tabPaired = document.createElement('button');
-    tabPaired.id = TAB_PAIRED_ID;
-    tabPaired.className = '__gm_tab';
-    tabPaired.textContent = 'Paired';
-    tabPaired.type = 'button';
-
-    tabRow.appendChild(tabBatch);
-    tabRow.appendChild(tabPaired);
-
-    /* ---- Batch view (original) ---- */
-    const viewBatch = document.createElement('div');
-    viewBatch.id = VIEW_BATCH_ID;
+    const view = document.createElement('div');
 
     const numsLabel = document.createElement('div');
     numsLabel.textContent = 'Phone Numbers';
@@ -453,64 +358,10 @@
     msgBox.addEventListener('focus', focusHandler);
     msgBox.addEventListener('blur', blurHandler);
 
-    viewBatch.appendChild(numsLabel);
-    viewBatch.appendChild(numsBox);
-    viewBatch.appendChild(msgLabel);
-    viewBatch.appendChild(msgBox);
-
-    /* ---- Paired view ---- */
-    const viewPaired = document.createElement('div');
-    viewPaired.id = VIEW_PAIRED_ID;
-    viewPaired.style.display = 'none';
-
-    const pairedLabel = document.createElement('div');
-    pairedLabel.textContent = 'Paste from Sheets or Type Pairs';
-    Object.assign(pairedLabel.style, {
-      marginBottom:    '6px',
-      fontSize:        '10px',
-      fontWeight:      '600',
-      color:           T.gold,
-      textTransform:   'uppercase',
-      letterSpacing:   '0.06em',
-      opacity:         '0.85',
-    });
-
-    const pairedHint = document.createElement('div');
-    pairedHint.textContent = 'Select H & J in Sheets → Copy → Paste here. Or type: number | message';
-    Object.assign(pairedHint.style, {
-      marginBottom:  '8px',
-      fontSize:      '10px',
-      color:         T.textMuted,
-      lineHeight:    '1.5',
-    });
-
-    const pairedBox = document.createElement('textarea');
-    pairedBox.id = PAIRED_ID;
-    Object.assign(pairedBox.style, {
-      ...inputStyles,
-      height:     '130px',
-      resize:     'vertical',
-      lineHeight: '1.6',
-    });
-    pairedBox.placeholder =
-      'Paste from Sheets (H+J columns) or type:\n' +
-      '5597409248 | Hey John, your order is ready!\n' +
-      '5597409249 | Hi Sarah, just following up.';
-    pairedBox.addEventListener('focus', focusHandler);
-    pairedBox.addEventListener('blur', blurHandler);
-
-    // Live preview
-    const preview = document.createElement('div');
-    preview.id = PREVIEW_ID;
-    preview.textContent = 'Parsed pairs will appear here…';
-
-    pairedBox.addEventListener('input', () => updatePreview());
-    pairedBox.addEventListener('paste', () => setTimeout(updatePreview, 50));
-
-    viewPaired.appendChild(pairedLabel);
-    viewPaired.appendChild(pairedHint);
-    viewPaired.appendChild(pairedBox);
-    viewPaired.appendChild(preview);
+    view.appendChild(numsLabel);
+    view.appendChild(numsBox);
+    view.appendChild(msgLabel);
+    view.appendChild(msgBox);
 
     /* ---- Buttons ---- */
     const btnRow = document.createElement('div');
@@ -589,36 +440,13 @@
 
     btnRow.appendChild(startBtn);
     btnRow.appendChild(stopBtn);
+
     panel.appendChild(title);
-    panel.appendChild(tabRow);
-    panel.appendChild(viewBatch);
-    panel.appendChild(viewPaired);
+    panel.appendChild(view);
     panel.appendChild(btnRow);
     panel.appendChild(nextBtn);
     panel.appendChild(status);
     document.body.appendChild(panel);
-  }
-
-  /* ---------- Tab switching ---------- */
-
-  function switchTab(mode) {
-    activeMode = mode;
-    const tabBatch  = document.getElementById(TAB_BATCH_ID);
-    const tabPaired = document.getElementById(TAB_PAIRED_ID);
-    const viewBatch  = document.getElementById(VIEW_BATCH_ID);
-    const viewPaired = document.getElementById(VIEW_PAIRED_ID);
-
-    if (mode === 'batch') {
-      tabBatch.classList.add('__gm_tab_active');
-      tabPaired.classList.remove('__gm_tab_active');
-      viewBatch.style.display  = 'block';
-      viewPaired.style.display = 'none';
-    } else {
-      tabPaired.classList.add('__gm_tab_active');
-      tabBatch.classList.remove('__gm_tab_active');
-      viewBatch.style.display  = 'none';
-      viewPaired.style.display = 'block';
-    }
   }
 
   /* ---------- Parsers ---------- */
@@ -634,161 +462,6 @@
         seen.add(s);
         return true;
       });
-  }
-
-  function parsePairs(raw) {
-    const pairs = [];
-
-    const records = [];
-    const rawLines = raw.split('\n');
-    let buffer = null;
-
-    for (let i = 0; i < rawLines.length; i++) {
-      const line = rawLines[i];
-
-      if (buffer !== null) {
-        buffer += '\n' + line;
-        if (line.trimEnd().endsWith('"')) {
-          records.push(buffer);
-          buffer = null;
-        }
-        continue;
-      }
-
-      const tabIdx = line.indexOf('\t');
-      if (tabIdx !== -1) {
-        const afterTab = line.slice(tabIdx + 1);
-        if (afterTab.trimStart().startsWith('"') && !afterTab.trimEnd().endsWith('"')) {
-          buffer = line;
-          continue;
-        }
-      }
-
-      const pipeIdx = line.indexOf('|');
-      if (pipeIdx !== -1 && tabIdx === -1) {
-        const afterPipe = line.slice(pipeIdx + 1);
-        if (afterPipe.trimStart().startsWith('"') && !afterPipe.trimEnd().endsWith('"')) {
-          buffer = line;
-          continue;
-        }
-      }
-
-      if (line.trim()) {
-        records.push(line);
-      }
-    }
-    if (buffer !== null) {
-      records.push(buffer);
-    }
-
-    for (const record of records) {
-      let num = '';
-      let msg = '';
-
-      if (record.includes('\t')) {
-        const tabIdx = record.indexOf('\t');
-        const firstPart = record.slice(0, tabIdx).trim();
-        let rest = record.slice(tabIdx + 1);
-
-        const secondTab = rest.indexOf('\t');
-        if (secondTab !== -1) {
-          const lastTab = rest.lastIndexOf('\t');
-          const candidate = rest.slice(lastTab + 1).trim();
-          if (candidate) {
-            rest = candidate;
-          } else {
-            rest = rest.slice(0, lastTab).trim();
-          }
-        }
-
-        num = digits(firstPart);
-        msg = rest.trim();
-      }
-      else if (record.includes('|')) {
-        const idx = record.indexOf('|');
-        num = digits(record.slice(0, idx).trim());
-        msg = record.slice(idx + 1).trim();
-      }
-      else {
-        const match = record.match(/^([\d\s\-\+\(\)]+?)\s{2,}(.+)$/s) ||
-                      record.match(/^([\d\-\+\(\)]+)\s+(.+)$/s);
-        if (match) {
-          num = digits(match[1]);
-          msg = match[2].trim();
-        }
-      }
-
-      if (msg.startsWith('"') && msg.endsWith('"')) {
-        msg = msg.slice(1, -1);
-      }
-      msg = msg.replace(/""/g, '"');
-
-      if (num.length >= 7 && msg) {
-        pairs.push({ number: num, message: msg });
-      }
-    }
-    return pairs;
-  }
-
-  /* ---------- Live preview ---------- */
-
-  function updatePreview() {
-    const previewEl = document.getElementById(PREVIEW_ID);
-    const pairedBox = document.getElementById(PAIRED_ID);
-    if (!previewEl || !pairedBox) return;
-
-    while (previewEl.firstChild) previewEl.removeChild(previewEl.firstChild);
-
-    const pairs = parsePairs(pairedBox.value);
-
-    if (pairs.length === 0) {
-      const empty = document.createElement('span');
-      empty.style.color = T.textMuted;
-      empty.textContent = 'No valid pairs detected yet…';
-      previewEl.appendChild(empty);
-      return;
-    }
-
-    const maxShow = 20;
-
-    const header = document.createElement('div');
-    Object.assign(header.style, { color: T.info, marginBottom: '4px', fontSize: '9px', fontWeight: '600' });
-    header.textContent = `${pairs.length} pair${pairs.length !== 1 ? 's' : ''} found`;
-    previewEl.appendChild(header);
-
-    const show = pairs.slice(0, maxShow);
-    for (const p of show) {
-      const numDisplay = p.number.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3');
-      const firstLine  = p.message.split('\n')[0];
-      const msgShort   = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
-
-      const row = document.createElement('div');
-      row.className = 'pair-row';
-
-      const numSpan = document.createElement('span');
-      numSpan.className = 'pair-num';
-      numSpan.textContent = numDisplay;
-
-      const arrow = document.createElement('span');
-      arrow.className = 'pair-arrow';
-      arrow.textContent = '→';
-
-      const msgSpan = document.createElement('span');
-      msgSpan.className = 'pair-msg';
-      msgSpan.textContent = msgShort;
-
-      row.appendChild(numSpan);
-      row.appendChild(arrow);
-      row.appendChild(msgSpan);
-      previewEl.appendChild(row);
-    }
-
-    if (pairs.length > maxShow) {
-      const more = document.createElement('div');
-      Object.assign(more.style, { color: T.textMuted, marginTop: '2px' });
-      more.textContent = `…and ${pairs.length - maxShow} more`;
-      previewEl.appendChild(more);
-    }
   }
 
   /* ---------- Reset to main view ---------- */
@@ -928,7 +601,7 @@
     throw new Error('Could not enter conversation after clicking contact');
   }
 
-  /* ---------- Pre-extract message content once per batch (batch mode) ---------- */
+  /* ---------- Pre-extract message content once per batch ---------- */
   let _cachedText = null;
   let _cachedImageBlobs = null;
 
@@ -996,10 +669,10 @@
     return _cachedImageBlobs;
   }
 
-  async function transferContent(composer, textOverride = null) {
+  async function transferContent(composer) {
     composer.focus();
 
-    const textToSend = textOverride !== null ? textOverride : _cachedText;
+    const textToSend = _cachedText;
 
     if (textToSend) {
       composer.focus();
@@ -1016,35 +689,33 @@
       await sleep(100);
     }
 
-    if (textOverride === null) {
-      const blobs = await ensureImageBlobs();
-      if (blobs && blobs.length > 0) {
-        const dt = new DataTransfer();
-        for (const blob of blobs) {
-          const file = new File([blob], 'image.png', { type: blob.type });
-          dt.items.add(file);
-        }
-        const pasteEvent = new ClipboardEvent('paste', {
-          clipboardData: dt,
-          bubbles:       true,
-          cancelable:    true
-        });
-        composer.dispatchEvent(pasteEvent);
+    const blobs = await ensureImageBlobs();
+    if (blobs && blobs.length > 0) {
+      const dt = new DataTransfer();
+      for (const blob of blobs) {
+        const file = new File([blob], 'image.png', { type: blob.type });
+        dt.items.add(file);
+      }
+      const pasteEvent = new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles:       true,
+        cancelable:    true
+      });
+      composer.dispatchEvent(pasteEvent);
 
-        try {
-          await waitFor(() => hasAttachment(), {
-            timeout: 3000, interval: 50, label: 'attachment after paste'
-          });
-        } catch {
-          // continue anyway
-        }
+      try {
+        await waitFor(() => hasAttachment(), {
+          timeout: 3000, interval: 50, label: 'attachment after paste'
+        });
+      } catch {
+        // continue anyway
       }
     }
   }
 
   /* ---------- Main per-number flow ---------- */
 
-  async function prepAndWaitSend(phone, index, total, textOverride = null) {
+  async function prepAndWaitSend(phone, index, total) {
     const tag         = `[${index + 1}/${total}]`;
     const phoneDigits = digits(phone);
 
@@ -1080,7 +751,7 @@
     document.execCommand('delete', false, null);
 
     setStatus(`${tag} Pasting content…`);
-    await transferContent(composer, textOverride);
+    await transferContent(composer);
 
     const sendBtn = await waitFor(() => cachedDeepFind('sendBtn', isSendButton), {
       timeout: 3000, interval: 30, label: 'send button'
@@ -1177,47 +848,6 @@
     setStatus(`Done. ${parts.join(', ')}.`);
   }
 
-  /* ---------- Paired runner (unique message per number) ---------- */
-
-  async function runPaired(pairs) {
-    stopRequested  = false;
-    waitingForNext = false;
-
-    _cachedText = null;
-    _cachedImageBlobs = [];
-
-    let successCount = 0;
-    let failCount    = 0;
-    const failedPairs = [];
-
-    for (let i = 0; i < pairs.length; i++) {
-      if (stopRequested) { setStatus('Stopped.'); break; }
-
-      const { number, message } = pairs[i];
-      const nameMatch = message.match(/^Hey\s+(\w+)/i);
-      const nameTag   = nameMatch ? nameMatch[1] : number;
-
-      try {
-        await prepAndWaitSend(number, i, pairs.length, message);
-        successCount++;
-        setStatus(`[${i + 1}/${pairs.length}] ✓ Sent to ${nameTag}`);
-      } catch (e) {
-        console.error('[BatchSender] FAILED:', nameTag, number, e);
-        failCount++;
-        failedPairs.push({ index: i + 1, name: nameTag, number, error: e.message });
-        setStatus(`[${i + 1}/${pairs.length}] ✗ FAILED: ${nameTag} — ${e.message}`);
-        waitingForNext = false;
-        await resetToMainView();
-        await sleep(500);
-      }
-    }
-    let summary = `Done. ${successCount} sent, ${failCount} failed.`;
-    if (failedPairs.length > 0) {
-      summary += ' Failed: ' + failedPairs.map(f => `${f.name}(#${f.index})`).join(', ');
-    }
-    setStatus(summary);
-  }
-
   /* ---------- Wire UI ---------- */
 
   function wireUI() {
@@ -1226,26 +856,13 @@
     const nextBtn   = document.getElementById(NEXT_BTN_ID);
     const numsBox   = document.getElementById(NUMS_ID);
     const msgBox    = document.getElementById(MSG_ID);
-    const pairedBox = document.getElementById(PAIRED_ID);
-    const tabBatch  = document.getElementById(TAB_BATCH_ID);
-    const tabPaired = document.getElementById(TAB_PAIRED_ID);
-
-    tabBatch.addEventListener('click', () => switchTab('batch'));
-    tabPaired.addEventListener('click', () => switchTab('paired'));
 
     startBtn.addEventListener('click', () => {
-      if (activeMode === 'batch') {
-        const nums = parseNumbers(numsBox.value);
-        if (!nums.length) return setStatus('Add at least one valid number (7+ digits).');
-        if (!msgBox.innerText.trim() && !msgBox.querySelector('img')) return setStatus('Add content.');
-        setStatus('Starting batch…');
-        runBatch(nums);
-      } else {
-        const pairs = parsePairs(pairedBox.value);
-        if (!pairs.length) return setStatus('No valid pairs found. Check your paste or format.');
-        setStatus(`Starting paired send (${pairs.length} pairs)…`);
-        runPaired(pairs);
-      }
+      const nums = parseNumbers(numsBox.value);
+      if (!nums.length) return setStatus('Add at least one valid number (7+ digits).');
+      if (!msgBox.innerText.trim() && !msgBox.querySelector('img')) return setStatus('Add content.');
+      setStatus('Starting batch…');
+      runBatch(nums);
     });
 
     stopBtn.addEventListener('click', () => {
