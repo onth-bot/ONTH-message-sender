@@ -5,8 +5,8 @@
 // @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Strict session-level duplicate prevention for both modes. Prevents button spam. Minimizable.
 // @author       You
 // @match        https://messages.google.com/*
-// @downloadURL  https://raw.githubusercontent.com/onth-bot/ONTH-Route-Scanner/main/messages-sender.user.js
-// @updateURL    https://raw.githubusercontent.com/onth-bot/ONTH-Route-Scanner/main/messages-sender.user.js
+// @downloadURL  https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
+// @updateURL    https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
