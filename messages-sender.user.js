@@ -1,12 +1,10 @@
 // ==UserScript==
 // @name         Messages Sender
 // @namespace    http://tampermonkey.net/
-// @version      4.4
-// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Strict session-level duplicate prevention for both modes. Prevents button spam.
+// @version      4.5
+// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Strict session-level duplicate prevention for both modes. Prevents button spam. Minimizable.
 // @author       You
 // @match        https://messages.google.com/*
-// @downloadURL  https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
-// @updateURL    https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -27,6 +25,10 @@
   const VIEW_BATCH_ID  = '__gm_view_batch';
   const VIEW_PAIRED_ID = '__gm_view_paired';
   const PREVIEW_ID     = '__gm_batch_preview';
+  const MIN_BTN_ID     = '__gm_batch_minimize';
+  const PILL_ID        = '__gm_batch_pill';
+  const PILL_STATUS_ID = '__gm_batch_pill_status';
+  const BODY_ID        = '__gm_batch_body';
 
   // -------- Reliability knobs --------
   const MAX_TRIES_PER_NUMBER   = 2;
@@ -38,6 +40,7 @@
   let waitingForNext = false;
   let isRunning      = false;
   let activeMode     = 'batch';
+  let isMinimized    = false;
 
   // Strict session registry: tracks "number|message_snippet" to prevent ANY double sends in one session.
   const sessionSentRegistry = new Set();
@@ -149,6 +152,8 @@
   function setStatus(txt) {
     const el = document.getElementById(STATUS_ID);
     if (el) el.textContent = txt;
+    const pillStatus = document.getElementById(PILL_STATUS_ID);
+    if (pillStatus) pillStatus.textContent = txt;
     console.log('[BatchSender]', txt);
   }
 
@@ -160,6 +165,27 @@
         startBtn.style.opacity = running ? '0.5' : '1';
         startBtn.style.cursor = running ? 'not-allowed' : 'pointer';
         startBtn.textContent = running ? 'Running...' : 'Start Batch';
+    }
+    updatePillIndicator();
+  }
+
+  function updatePillIndicator() {
+    const pill = document.getElementById(PILL_ID);
+    if (!pill) return;
+    const dot = pill.querySelector('.__gm_pill_dot');
+    if (!dot) return;
+    if (isRunning) {
+      dot.style.background = T.gold;
+      dot.style.boxShadow = `0 0 8px ${T.gold}`;
+      dot.style.animation = '__gm_pulse 1.4s ease-in-out infinite';
+    } else if (waitingForNext) {
+      dot.style.background = T.warning;
+      dot.style.boxShadow = `0 0 6px ${T.warning}`;
+      dot.style.animation = '__gm_pulse 1.4s ease-in-out infinite';
+    } else {
+      dot.style.background = T.textMuted;
+      dot.style.boxShadow = 'none';
+      dot.style.animation = 'none';
     }
   }
 
@@ -235,17 +261,44 @@
     return btn;
   }
 
+  /* ---------- Minimize / restore ---------- */
+  function setMinimized(minimize) {
+    isMinimized = minimize;
+    const panel = document.getElementById(PANEL_ID);
+    const pill  = document.getElementById(PILL_ID);
+    if (!panel || !pill) return;
+    if (minimize) {
+      panel.style.display = 'none';
+      pill.style.display  = 'flex';
+      updatePillIndicator();
+    } else {
+      panel.style.display = 'block';
+      pill.style.display  = 'none';
+    }
+  }
+
   /* ---------- UI Panel ---------- */
   function addPanel() {
     if (document.getElementById(PANEL_ID)) return;
 
     const style = document.createElement('style');
     style.textContent = `
+      @keyframes __gm_pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
+      }
       #${MSG_ID} img { max-height: 150px; max-width: 100%; height: auto; width: auto; display: block; margin: 4px 0; border-radius: 4px; border: 1px solid ${T.border}; }
       #${START_BTN_ID}:hover:not(:disabled) { background: ${T.gold} !important; color: ${T.pageBg} !important; transform: translateY(-1px); box-shadow: 0 6px 24px rgba(245, 197, 24, 0.25); }
       #${STOP_BTN_ID}:hover { background: rgba(240, 160, 160, 0.1) !important; border-color: ${T.danger} !important; color: ${T.danger} !important; transform: translateY(-1px); }
       #${NEXT_BTN_ID}:hover { background: ${T.goldHover} !important; border-color: ${T.gold} !important; color: ${T.gold} !important; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(245, 197, 24, 0.12); }
       #${START_BTN_ID}, #${STOP_BTN_ID}, #${NEXT_BTN_ID} { transition: all 0.2s ease; }
+      #${MIN_BTN_ID} { background: transparent; border: 1px solid ${T.border}; color: ${T.textMuted}; width: 24px; height: 24px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; transition: all 0.15s ease; font-size: 14px; line-height: 1; }
+      #${MIN_BTN_ID}:hover { border-color: ${T.goldBorder}; color: ${T.gold}; background: ${T.goldDim}; }
+      #${PILL_ID} { position: fixed; top: 16px; right: 16px; z-index: 2147483647; display: none; align-items: center; gap: 8px; padding: 8px 12px; background: ${T.panelBg}; border: 1px solid ${T.border}; border-radius: 999px; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,0.6), 0 0 0 1px rgba(245,197,24,0.06); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-size: 11px; color: ${T.textBody}; transition: all 0.2s ease; max-width: 260px; }
+      #${PILL_ID}:hover { border-color: ${T.goldBorder}; background: ${T.cardBg}; transform: translateY(-1px); box-shadow: 0 12px 32px rgba(0,0,0,0.75), 0 0 0 1px ${T.goldBorder}; }
+      #${PILL_ID} .__gm_pill_dot { width: 8px; height: 8px; border-radius: 50%; background: ${T.textMuted}; flex-shrink: 0; transition: all 0.2s ease; }
+      #${PILL_ID} .__gm_pill_label { color: ${T.gold}; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; font-size: 10px; flex-shrink: 0; }
+      #${PILL_ID} #${PILL_STATUS_ID} { color: ${T.textMuted}; font-family: Monaco, "Courier New", monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
       .__gm_tab { flex: 1; padding: 9px 0; background: transparent; color: ${T.textMuted}; border: none; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; transition: all 0.2s ease; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
       .__gm_tab:hover { color: ${T.textBody}; }
       .__gm_tab.__gm_tab_active { color: ${T.gold}; border-bottom-color: ${T.gold}; }
@@ -280,15 +333,37 @@
       lineHeight:     '1.4',
     });
 
+    /* ---- Header (title + minimize) ---- */
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      display:        'flex',
+      alignItems:     'center',
+      justifyContent: 'space-between',
+      marginBottom:   '12px',
+    });
+
     const title = document.createElement('div');
     title.textContent = 'Batch Sender';
     Object.assign(title.style, {
       fontWeight:     '700',
-      marginBottom:   '12px',
       fontSize:       '15px',
       color:          T.gold,
       letterSpacing:  '-0.01em',
     });
+
+    const minBtn = document.createElement('button');
+    minBtn.id = MIN_BTN_ID;
+    minBtn.type = 'button';
+    minBtn.title = 'Minimize';
+    minBtn.setAttribute('aria-label', 'Minimize panel');
+    minBtn.textContent = '–';
+
+    header.appendChild(title);
+    header.appendChild(minBtn);
+
+    /* ---- Body wrapper (everything below header) ---- */
+    const body = document.createElement('div');
+    body.id = BODY_ID;
 
     /* ---- Tabs ---- */
     const tabRow = document.createElement('div');
@@ -406,14 +481,40 @@
 
     btnRow.appendChild(startBtn);
     btnRow.appendChild(stopBtn);
-    panel.appendChild(title);
-    panel.appendChild(tabRow);
-    panel.appendChild(viewBatch);
-    panel.appendChild(viewPaired);
-    panel.appendChild(btnRow);
-    panel.appendChild(nextBtn);
-    panel.appendChild(status);
+
+    body.appendChild(tabRow);
+    body.appendChild(viewBatch);
+    body.appendChild(viewPaired);
+    body.appendChild(btnRow);
+    body.appendChild(nextBtn);
+    body.appendChild(status);
+
+    panel.appendChild(header);
+    panel.appendChild(body);
     document.body.appendChild(panel);
+
+    /* ---- Minimized pill ---- */
+    const pill = document.createElement('div');
+    pill.id = PILL_ID;
+    pill.title = 'Click to expand Batch Sender';
+    pill.setAttribute('role', 'button');
+    pill.setAttribute('tabindex', '0');
+
+    const pillDot = document.createElement('div');
+    pillDot.className = '__gm_pill_dot';
+
+    const pillLabel = document.createElement('span');
+    pillLabel.className = '__gm_pill_label';
+    pillLabel.textContent = 'Batch';
+
+    const pillStatus = document.createElement('span');
+    pillStatus.id = PILL_STATUS_ID;
+    pillStatus.textContent = 'Ready';
+
+    pill.appendChild(pillDot);
+    pill.appendChild(pillLabel);
+    pill.appendChild(pillStatus);
+    document.body.appendChild(pill);
   }
 
   /* ---------- Tab switching ---------- */
@@ -782,10 +883,12 @@
 
     setStatus(`${tag} Click Send. Waiting…`);
     waitingForNext = true;
+    updatePillIndicator();
     await sleep(150);
 
     const confirmed = await waitForSendConfirmation({ composer, sendBtn });
     waitingForNext = false;
+    updatePillIndicator();
     sendBtn.style.outline       = '';
     sendBtn.style.outlineOffset = '';
 
@@ -811,6 +914,7 @@
         lastErr = e;
         console.error('[BatchSender] attempt failed', attempt, number, e);
         waitingForNext = false;
+        updatePillIndicator();
         await resetToMainView();
         await sleep(500);
       }
@@ -968,9 +1072,17 @@
     const pairedBox = document.getElementById(PAIRED_ID);
     const tabBatch  = document.getElementById(TAB_BATCH_ID);
     const tabPaired = document.getElementById(TAB_PAIRED_ID);
+    const minBtn    = document.getElementById(MIN_BTN_ID);
+    const pill      = document.getElementById(PILL_ID);
 
     tabBatch.addEventListener('click', () => switchTab('batch'));
     tabPaired.addEventListener('click', () => switchTab('paired'));
+
+    minBtn.addEventListener('click', () => setMinimized(true));
+    pill.addEventListener('click', () => setMinimized(false));
+    pill.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMinimized(false); }
+    });
 
     startBtn.addEventListener('click', () => {
       if (isRunning) return;
@@ -998,6 +1110,7 @@
 
     nextBtn.addEventListener('click', () => {
       waitingForNext = false;
+      updatePillIndicator();
       setStatus('Continuing…');
     });
   }
