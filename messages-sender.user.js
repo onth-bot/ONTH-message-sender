@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Messages Sender
 // @namespace    http://tampermonkey.net/
-// @version      4.5
-// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Strict session-level duplicate prevention for both modes. Prevents button spam. Minimizable.
+// @version      4.7
+// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Strict session-level duplicate prevention for both modes. Prevents button spam. Minimizable. v4.7: positive send confirmation using live-DOM-confirmed selectors (data-e2e-message-outgoing + data-e2e-text-message-content).
 // @author       You
 // @match        https://messages.google.com/*
 // @downloadURL  https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
@@ -21,6 +21,7 @@
   const NUMS_ID        = '__gm_batch_numbers';
   const MSG_ID         = '__gm_batch_message';
   const STATUS_ID      = '__gm_batch_status';
+  const FAILURES_ID    = '__gm_batch_failures';
   const PAIRED_ID      = '__gm_batch_paired';
   const TAB_BATCH_ID   = '__gm_tab_batch';
   const TAB_PAIRED_ID  = '__gm_tab_paired';
@@ -36,7 +37,9 @@
   const MAX_TRIES_PER_NUMBER   = 2;
   const MAX_POST_RUN_PASSES    = 1;
   const SEND_CONFIRM_TIMEOUTMS = 300000;
-  const CONFIRM_GRACE_MS       = 250;
+  const CONFIRM_GRACE_MS       = 350;
+  // How long to scan the thread for positive confirmation after composer clears
+  const POSITIVE_CONFIRM_MS    = 4000;
 
   let stopRequested  = false;
   let waitingForNext = false;
@@ -49,26 +52,29 @@
 
   const getSignature = (num, msg) => `${num}|${(msg || '').trim().slice(0, 50)}`;
 
-  const sleep   = (ms) => new Promise(r => setTimeout(r, ms));
-  const digits  = (s) => (s || '').replace(/\D+/g, '');
+  const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
+  const digits = (s)  => (s || '').replace(/\D+/g, '');
 
-  /* ---------- Theme tokens ---------- */
+  /* ---------- Theme tokens (Glass-Dark Logistics) ---------- */
   const T = {
-    pageBg:       '#0a0a0a',
-    panelBg:      '#111214',
-    cardBg:       '#18191d',
-    border:       '#2a2c31',
-    gold:         '#f5c518',
-    goldDim:      'rgba(245,197,24,0.08)',
-    goldBorder:   'rgba(245,197,24,0.22)',
-    goldHover:    'rgba(245,197,24,0.15)',
-    textPrimary:  '#f0efe8',
-    textBody:     '#c8c8c8',
-    textMuted:    '#78797f',
-    danger:       '#f0a0a0',
-    warning:      '#f5b880',
-    success:      '#72dda0',
-    info:         '#e0cc78',
+    pageBg:      '#080a0d',
+    panelBg:     '#111520',
+    cardBg:      '#111520',
+    border:      '#1e2535',
+    cyan:        '#00d4ff',
+    cyanDim:     '#006e85',
+    cyanBorder:  'rgba(0, 212, 255, 0.25)',
+    cyanHover:   'rgba(0, 212, 255, 0.15)',
+    textPrimary: '#e8edf5',
+    textBody:    '#e8edf5',
+    textMuted:   '#4a5568',
+    danger:      '#ff4d6a',
+    dangerBg:    'rgba(255,77,106,0.1)',
+    warning:     '#ffb020',
+    warningBg:   'rgba(255,176,32,0.1)',
+    success:     '#22d98a',
+    successBg:   'rgba(34,217,138,0.1)',
+    info:        '#40e4ff',
   };
 
   /* ---------- Core polling helper ---------- */
@@ -129,7 +135,7 @@
 
   const setVal = (el, val) => {
     if (!el) return;
-    const nativeInputValueSetter    = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const nativeInputValueSetter     = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,  'value')?.set;
     const nativeTextAreaValueSetter  = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
     if (el.tagName === 'TEXTAREA' && nativeTextAreaValueSetter) {
       nativeTextAreaValueSetter.call(el, val);
@@ -138,15 +144,14 @@
     } else {
       el.value = val;
     }
-    el.dispatchEvent(new Event('input',  { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('input', { bubbles: true }));
   };
 
   const strongClick = (el) => {
     if (!el) return;
     el.scrollIntoView({ behavior: 'instant', block: 'center' });
     el.focus?.();
-    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type =>
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type =>
       el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 }))
     );
   };
@@ -159,16 +164,59 @@
     console.log('[BatchSender]', txt);
   }
 
+  /* ---------- Failures UI ---------- */
+  function showFailuresInUI(failedItems) {
+    const box = document.getElementById(FAILURES_ID);
+    if (!box) return;
+    if (!failedItems || !failedItems.length) {
+      box.style.display = 'none';
+      box.textContent   = '';
+      return;
+    }
+    box.style.display = 'block';
+    box.textContent   = '';
+
+    const header = document.createElement('div');
+    Object.assign(header.style, { color: T.danger, fontFamily: "'DM Mono', monospace", marginBottom: '6px', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.06em' });
+    header.textContent = `⚠ ${failedItems.length} FAILED — copy numbers below:`;
+    box.appendChild(header);
+
+    const list = document.createElement('div');
+    Object.assign(list.style, { fontFamily: "'DM Mono', monospace", fontSize: '10px', color: T.textBody, lineHeight: '1.7', userSelect: 'all' });
+    list.textContent = failedItems.map(f => f.number).join('\n');
+    box.appendChild(list);
+
+    console.group('[BatchSender] FINAL FAILURES');
+    console.table(failedItems);
+    console.groupEnd();
+  }
+
   function toggleRunState(running) {
     isRunning = running;
     const startBtn = document.getElementById(START_BTN_ID);
     if (startBtn) {
-        startBtn.disabled = running;
-        startBtn.style.opacity = running ? '0.5' : '1';
-        startBtn.style.cursor = running ? 'not-allowed' : 'pointer';
-        startBtn.textContent = running ? 'Running...' : 'Start Batch';
+      startBtn.disabled      = running;
+      startBtn.style.opacity = running ? '0.5' : '1';
+      startBtn.style.cursor  = running ? 'not-allowed' : 'pointer';
+      startBtn.textContent   = running ? 'Running…' : 'Start Batch';
+    }
+    const nextBtn = document.getElementById(NEXT_BTN_ID);
+    if (nextBtn) {
+      if (!running) {
+        nextBtn.disabled      = true;
+        nextBtn.style.opacity = '0.4';
+        nextBtn.style.cursor  = 'not-allowed';
+      }
     }
     updatePillIndicator();
+  }
+
+  function setNextButtonEnabled(enabled) {
+    const nextBtn = document.getElementById(NEXT_BTN_ID);
+    if (!nextBtn) return;
+    nextBtn.disabled      = !enabled;
+    nextBtn.style.opacity  = enabled ? '1' : '0.4';
+    nextBtn.style.cursor   = enabled ? 'pointer' : 'not-allowed';
   }
 
   function updatePillIndicator() {
@@ -177,17 +225,17 @@
     const dot = pill.querySelector('.__gm_pill_dot');
     if (!dot) return;
     if (isRunning) {
-      dot.style.background = T.gold;
-      dot.style.boxShadow = `0 0 8px ${T.gold}`;
-      dot.style.animation = '__gm_pulse 1.4s ease-in-out infinite';
+      dot.style.background  = T.cyan;
+      dot.style.boxShadow   = `0 0 8px ${T.cyanBorder}`;
+      dot.style.animation   = '__gm_pulse 1.4s infinite';
     } else if (waitingForNext) {
-      dot.style.background = T.warning;
-      dot.style.boxShadow = `0 0 6px ${T.warning}`;
-      dot.style.animation = '__gm_pulse 1.4s ease-in-out infinite';
+      dot.style.background  = T.warning;
+      dot.style.boxShadow   = `0 0 8px ${T.warningBg}`;
+      dot.style.animation   = '__gm_pulse 1.4s infinite';
     } else {
-      dot.style.background = T.textMuted;
-      dot.style.boxShadow = 'none';
-      dot.style.animation = 'none';
+      dot.style.background  = T.textMuted;
+      dot.style.boxShadow   = 'none';
+      dot.style.animation   = 'none';
     }
   }
 
@@ -205,7 +253,31 @@
     return composerEmpty && noAttachment;
   }
 
-  /* ---------- Element finders ---------- */
+  function getLastOutgoingMessageText() {
+    const all = [];
+    const walk = (root) => {
+      root.querySelectorAll('[data-e2e-message-outgoing]').forEach(wrapper => {
+        const textEl = wrapper.querySelector('[data-e2e-text-message-content]');
+        if (textEl) all.push(textEl.textContent.trim());
+        if (wrapper.shadowRoot) walk(wrapper.shadowRoot);
+      });
+    };
+    walk(document);
+    return all.length ? all[all.length - 1] : null;
+  }
+
+  function messageSentInThread(expectedTextSnippet, outgoingCountBefore) {
+    if (!expectedTextSnippet) {
+      return document.querySelectorAll('[data-e2e-message-outgoing]').length > outgoingCountBefore;
+    }
+    const currentCount = document.querySelectorAll('[data-e2e-message-outgoing]').length;
+    if (currentCount <= outgoingCountBefore) return false;
+    const lastText = getLastOutgoingMessageText();
+    if (!lastText) return false;
+    const snippet = expectedTextSnippet.trim().slice(0, 40).toLowerCase();
+    return lastText.toLowerCase().includes(snippet);
+  }
+
   function findNumberInput() {
     let inp = deepFind(el =>
       (el.tagName === 'INPUT' || el.getAttribute('role') === 'combobox') &&
@@ -263,7 +335,6 @@
     return btn;
   }
 
-  /* ---------- Minimize / restore ---------- */
   function setMinimized(minimize) {
     isMinimized = minimize;
     const panel = document.getElementById(PANEL_ID);
@@ -283,78 +354,85 @@
   function addPanel() {
     if (document.getElementById(PANEL_ID)) return;
 
+    if (!document.getElementById('gm-batch-fonts')) {
+      const fl = Object.assign(document.createElement('link'), { id:'gm-batch-fonts', rel:'stylesheet',
+        href:'https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:ital,wght@0,400;0,500&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700&display=swap' });
+      document.head.appendChild(fl);
+    }
+
     const style = document.createElement('style');
     style.textContent = `
-      @keyframes __gm_pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.4; }
-      }
+      @keyframes __gm_pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
       #${MSG_ID} img { max-height: 150px; max-width: 100%; height: auto; width: auto; display: block; margin: 4px 0; border-radius: 4px; border: 1px solid ${T.border}; }
-      #${START_BTN_ID}:hover:not(:disabled) { background: ${T.gold} !important; color: ${T.pageBg} !important; transform: translateY(-1px); box-shadow: 0 6px 24px rgba(245, 197, 24, 0.25); }
-      #${STOP_BTN_ID}:hover { background: rgba(240, 160, 160, 0.1) !important; border-color: ${T.danger} !important; color: ${T.danger} !important; transform: translateY(-1px); }
-      #${NEXT_BTN_ID}:hover { background: ${T.goldHover} !important; border-color: ${T.gold} !important; color: ${T.gold} !important; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(245, 197, 24, 0.12); }
+      #${START_BTN_ID}:hover:not(:disabled) { background: ${T.cyan} !important; color: ${T.pageBg} !important; transform: translateY(-1px); box-shadow: 0 4px 15px ${T.cyanBorder}; }
+      #${STOP_BTN_ID}:hover  { background: ${T.dangerBg} !important; border-color: ${T.danger} !important; color: ${T.danger} !important; transform: translateY(-1px); }
+      #${NEXT_BTN_ID}:hover:not(:disabled) { background: ${T.cyanHover} !important; border-color: ${T.cyan} !important; color: ${T.cyan} !important; transform: translateY(-1px); box-shadow: 0 4px 15px ${T.cyanBorder}; }
       #${START_BTN_ID}, #${STOP_BTN_ID}, #${NEXT_BTN_ID} { transition: all 0.2s ease; }
-      #${MIN_BTN_ID} { background: transparent; border: 1px solid ${T.border}; color: ${T.textMuted}; width: 24px; height: 24px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; transition: all 0.15s ease; font-size: 14px; line-height: 1; }
-      #${MIN_BTN_ID}:hover { border-color: ${T.goldBorder}; color: ${T.gold}; background: ${T.goldDim}; }
-      #${PILL_ID} { position: fixed; top: 16px; right: 16px; z-index: 2147483647; display: none; align-items: center; gap: 8px; padding: 8px 12px; background: ${T.panelBg}; border: 1px solid ${T.border}; border-radius: 999px; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,0.6), 0 0 0 1px rgba(245,197,24,0.06); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-size: 11px; color: ${T.textBody}; transition: all 0.2s ease; max-width: 260px; }
-      #${PILL_ID}:hover { border-color: ${T.goldBorder}; background: ${T.cardBg}; transform: translateY(-1px); box-shadow: 0 12px 32px rgba(0,0,0,0.75), 0 0 0 1px ${T.goldBorder}; }
-      #${PILL_ID} .__gm_pill_dot { width: 8px; height: 8px; border-radius: 50%; background: ${T.textMuted}; flex-shrink: 0; transition: all 0.2s ease; }
-      #${PILL_ID} .__gm_pill_label { color: ${T.gold}; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; font-size: 10px; flex-shrink: 0; }
-      #${PILL_ID} #${PILL_STATUS_ID} { color: ${T.textMuted}; font-family: Monaco, "Courier New", monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
-      .__gm_tab { flex: 1; padding: 9px 0; background: transparent; color: ${T.textMuted}; border: none; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; transition: all 0.2s ease; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+      #${MIN_BTN_ID} { background: transparent; border: 1px solid ${T.border}; color: ${T.textMuted}; width: 24px; height: 24px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; transition: all 0.15s ease; font-size: 14px; line-height: 1; }
+      #${MIN_BTN_ID}:hover { border-color: ${T.cyanBorder}; color: ${T.cyan}; background: ${T.cyanHover}; }
+
+      #${PILL_ID} { position: fixed; top: 16px; right: 16px; z-index: 2147483647; display: none; align-items: center; gap: 8px; padding: 8px 12px; background: ${T.panelBg}; border: 1px solid ${T.border}; border-radius: 6px; cursor: pointer; box-shadow: 0 8px 24px rgba(8,10,13,0.9), 0 0 0 1px rgba(0,212,255,0.05); font-family: 'DM Sans', sans-serif; font-size: 11px; color: ${T.textBody}; transition: all 0.2s ease; max-width: 260px; }
+      #${PILL_ID}:hover { border-color: ${T.cyanBorder}; background: ${T.cardBg}; transform: translateY(-1px); box-shadow: 0 12px 32px rgba(8,10,13,0.95), 0 0 0 1px ${T.cyanBorder}; }
+      #${PILL_ID} .__gm_pill_dot   { width: 8px; height: 8px; border-radius: 50%; background: ${T.textMuted}; flex-shrink: 0; transition: all 0.2s ease; }
+      #${PILL_ID} .__gm_pill_label { color: ${T.cyan}; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; font-size: 10px; font-family: 'DM Mono', monospace; flex-shrink: 0; }
+      #${PILL_ID} #${PILL_STATUS_ID} { color: ${T.textMuted}; font-family: 'DM Mono', monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+
+      .__gm_tab { flex: 1; padding: 9px 0; background: transparent; color: ${T.textMuted}; border: none; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; transition: all 0.2s ease; font-family: 'DM Mono', monospace; }
       .__gm_tab:hover { color: ${T.textBody}; }
-      .__gm_tab.__gm_tab_active { color: ${T.gold}; border-bottom-color: ${T.gold}; }
-      #${PREVIEW_ID} { margin-top: 8px; max-height: 80px; overflow-y: auto; font-size: 10px; font-family: Monaco, "Courier New", monospace; color: ${T.textMuted}; padding: 8px 10px; background: ${T.pageBg}; border-radius: 6px; border: 1px solid ${T.border}; line-height: 1.5; }
-      #${PREVIEW_ID} .pair-row { display: flex; gap: 6px; padding: 2px 0; }
-      #${PREVIEW_ID} .pair-num { color: ${T.textBody}; flex-shrink: 0; min-width: 75px; }
-      #${PREVIEW_ID} .pair-arrow { color: ${T.gold}; flex-shrink: 0; }
-      #${PREVIEW_ID} .pair-msg { color: ${T.textMuted}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      #${PANEL_ID} ::-webkit-scrollbar { width: 4px; }
-      #${PANEL_ID} ::-webkit-scrollbar-track { background: transparent; }
-      #${PANEL_ID} ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
+      .__gm_tab.__gm_tab_active { color: ${T.cyan}; border-bottom-color: ${T.cyan}; }
+
+      #${PREVIEW_ID} { margin-top: 8px; max-height: 80px; overflow-y: auto; font-size: 10px; font-family: 'DM Mono', monospace; color: ${T.textMuted}; padding: 8px 10px; background: ${T.pageBg}; border-radius: 4px; border: 1px solid ${T.border}; line-height: 1.5; }
+      #${PREVIEW_ID} .pair-row   { display: flex; gap: 6px; padding: 2px 0; }
+      #${PREVIEW_ID} .pair-num   { color: ${T.textBody}; flex-shrink: 0; min-width: 75px; }
+      #${PREVIEW_ID} .pair-arrow { color: ${T.cyan}; flex-shrink: 0; }
+      #${PREVIEW_ID} .pair-msg   { color: ${T.textMuted}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+      #${FAILURES_ID} { display: none; margin-top: 10px; padding: 10px; background: ${T.dangerBg}; border: 1px solid rgba(255,77,106,0.3); border-radius: 4px; max-height: 120px; overflow-y: auto; }
+
+      #${PANEL_ID} ::-webkit-scrollbar        { width: 4px; }
+      #${PANEL_ID} ::-webkit-scrollbar-track  { background: transparent; }
+      #${PANEL_ID} ::-webkit-scrollbar-thumb  { background: ${T.border}; border-radius: 4px; }
       #${PANEL_ID} ::-webkit-scrollbar-thumb:hover { background: ${T.textMuted}; }
+
+      .__gm_header::after {
+        content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 2px;
+        background: linear-gradient(90deg, transparent, ${T.cyan}, transparent);
+      }
     `;
     document.head.appendChild(style);
 
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
     Object.assign(panel.style, {
-      position:       'fixed',
-      top:            '16px',
-      right:          '16px',
-      width:          '300px',
-      padding:        '16px',
-      background:     T.panelBg,
-      color:          T.textPrimary,
-      border:         `1px solid ${T.border}`,
-      borderRadius:   '14px',
-      boxShadow:      '0 24px 64px rgba(0,0,0,0.8), 0 0 0 1px rgba(245,197,24,0.06)',
-      zIndex:         '2147483647',
-      fontFamily:     '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
-      fontSize:       '13px',
-      lineHeight:     '1.4',
+      position:     'fixed',
+      top:          '16px',
+      right:        '16px',
+      width:        '260px',
+      padding:      '12px',
+      background:   T.panelBg,
+      backgroundImage: `linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px)`,
+      backgroundSize: '40px 40px',
+      color:        T.textPrimary,
+      border:       `1px solid ${T.border}`,
+      borderRadius: '6px',
+      boxShadow:    '0 20px 50px rgba(8,10,13,0.9), 0 0 0 1px rgba(0,212,255,0.05)',
+      zIndex:       '2147483647',
+      fontFamily:   "'DM Sans', sans-serif",
+      fontSize:     '12px',
+      lineHeight:   '1.4',
     });
 
-    /* ---- Header (title + minimize) ---- */
+    /* ---- Header ---- */
     const header = document.createElement('div');
-    Object.assign(header.style, {
-      display:        'flex',
-      alignItems:     'center',
-      justifyContent: 'space-between',
-      marginBottom:   '12px',
-    });
+    header.className = '__gm_header';
+    Object.assign(header.style, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: '12px', marginBottom: '12px', position: 'relative' });
 
     const title = document.createElement('div');
     title.textContent = 'Batch Sender';
-    Object.assign(title.style, {
-      fontWeight:     '700',
-      fontSize:       '15px',
-      color:          T.gold,
-      letterSpacing:  '-0.01em',
-    });
+    Object.assign(title.style, { fontFamily: "'Bebas Neue', sans-serif", fontSize: '18px', color: T.cyan, letterSpacing: '1px', margin: '0' });
 
     const minBtn = document.createElement('button');
-    minBtn.id = MIN_BTN_ID;
+    minBtn.id   = MIN_BTN_ID;
     minBtn.type = 'button';
     minBtn.title = 'Minimize';
     minBtn.setAttribute('aria-label', 'Minimize panel');
@@ -363,7 +441,7 @@
     header.appendChild(title);
     header.appendChild(minBtn);
 
-    /* ---- Body wrapper (everything below header) ---- */
+    /* ---- Body wrapper ---- */
     const body = document.createElement('div');
     body.id = BODY_ID;
 
@@ -372,13 +450,13 @@
     Object.assign(tabRow.style, { display: 'flex', gap: '0', marginBottom: '14px', borderBottom: `1px solid ${T.border}` });
 
     const tabBatch = document.createElement('button');
-    tabBatch.id = TAB_BATCH_ID;
+    tabBatch.id        = TAB_BATCH_ID;
     tabBatch.className = '__gm_tab __gm_tab_active';
     tabBatch.textContent = 'Same Message';
     tabBatch.type = 'button';
 
     const tabPaired = document.createElement('button');
-    tabPaired.id = TAB_PAIRED_ID;
+    tabPaired.id        = TAB_PAIRED_ID;
     tabPaired.className = '__gm_tab';
     tabPaired.textContent = 'Paired';
     tabPaired.type = 'button';
@@ -386,36 +464,48 @@
     tabRow.appendChild(tabBatch);
     tabRow.appendChild(tabPaired);
 
+    /* ---- Input styles helper ---- */
+    const inputStyles = {
+      width: '100%', background: T.cardBg, color: T.textPrimary,
+      border: `1px solid ${T.border}`, borderRadius: '4px',
+      padding: '8px', boxSizing: 'border-box', fontSize: '10px',
+      fontFamily: "'DM Mono', monospace",
+      transition: 'all 0.2s ease', outline: 'none',
+    };
+    const focusHandler = function () { this.style.border = `1px solid ${T.cyan}`; this.style.boxShadow = `0 0 0 3px ${T.cyanBorder}`; };
+    const blurHandler  = function () { this.style.border = `1px solid ${T.border}`;      this.style.boxShadow = 'none'; };
+
+    const labelStyles = { marginBottom: '6px', fontSize: '10px', fontFamily: "'DM Mono', monospace", color: T.cyan, textTransform: 'uppercase', letterSpacing: '0.06em', opacity: '0.85' };
+
     /* ---- Batch view ---- */
     const viewBatch = document.createElement('div');
     viewBatch.id = VIEW_BATCH_ID;
 
     const numsLabel = document.createElement('div');
     numsLabel.textContent = 'Phone Numbers';
-    Object.assign(numsLabel.style, { marginBottom: '6px', fontSize: '10px', fontWeight: '600', color: T.gold, textTransform: 'uppercase', letterSpacing: '0.06em', opacity: '0.85' });
-
-    const inputStyles = { width: '100%', background: T.cardBg, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: '8px', padding: '10px', boxSizing: 'border-box', fontSize: '12px', fontFamily: 'Monaco, "Courier New", monospace', transition: 'all 0.2s ease', outline: 'none' };
-
-    const focusHandler = function () { this.style.border = `1px solid ${T.goldBorder}`; this.style.boxShadow = `0 0 0 3px ${T.goldDim}`; };
-    const blurHandler = function ()  { this.style.border = `1px solid ${T.border}`; this.style.boxShadow = 'none'; };
+    Object.assign(numsLabel.style, labelStyles);
 
     const numsBox = document.createElement('textarea');
     numsBox.id = NUMS_ID;
-    Object.assign(numsBox.style, { ...inputStyles, height: '70px', resize: 'vertical' });
+    Object.assign(numsBox.style, { ...inputStyles, height: '55px', resize: 'vertical' });
     numsBox.placeholder = '5597409248\n5597409249\n...';
     numsBox.addEventListener('focus', focusHandler);
-    numsBox.addEventListener('blur', blurHandler);
+    numsBox.addEventListener('blur',  blurHandler);
 
     const msgLabel = document.createElement('div');
     msgLabel.textContent = 'Message Content';
-    Object.assign(msgLabel.style, { margin: '12px 0 6px 0', fontSize: '10px', fontWeight: '600', color: T.gold, textTransform: 'uppercase', letterSpacing: '0.06em', opacity: '0.85' });
+    Object.assign(msgLabel.style, { ...labelStyles, margin: '12px 0 6px 0' });
 
     const msgBox = document.createElement('div');
     msgBox.id = MSG_ID;
     msgBox.contentEditable = 'true';
-    Object.assign(msgBox.style, { width: '100%', minHeight: '55px', maxHeight: '100px', overflowY: 'auto', background: T.cardBg, color: T.textPrimary, border: `1px solid ${T.border}`, borderRadius: '8px', padding: '10px', boxSizing: 'border-box', outline: 'none', fontSize: '12px', transition: 'all 0.2s ease', whiteSpace: 'pre-wrap', wordWrap: 'break-word' });
+    Object.assign(msgBox.style, {
+      ...inputStyles,
+      minHeight: '45px', maxHeight: '80px', overflowY: 'auto',
+      whiteSpace: 'pre-wrap', wordWrap: 'break-word',
+    });
     msgBox.addEventListener('focus', focusHandler);
-    msgBox.addEventListener('blur', blurHandler);
+    msgBox.addEventListener('blur',  blurHandler);
 
     viewBatch.appendChild(numsLabel);
     viewBatch.appendChild(numsBox);
@@ -429,18 +519,16 @@
 
     const pairedLabel = document.createElement('div');
     pairedLabel.textContent = 'Paste from Sheets or Type Pairs';
-    Object.assign(pairedLabel.style, { marginBottom: '6px', fontSize: '10px', fontWeight: '600', color: T.gold, textTransform: 'uppercase', letterSpacing: '0.06em', opacity: '0.85' });
+    Object.assign(pairedLabel.style, labelStyles);
 
     const pairedHint = document.createElement('div');
-    pairedHint.textContent = 'Select H & J in Sheets → Copy → Paste here. Or type: number | message';
     Object.assign(pairedHint.style, { marginBottom: '8px', fontSize: '10px', color: T.textMuted, lineHeight: '1.5' });
 
     const pairedBox = document.createElement('textarea');
     pairedBox.id = PAIRED_ID;
-    Object.assign(pairedBox.style, { ...inputStyles, height: '130px', resize: 'vertical', lineHeight: '1.6' });
-    pairedBox.placeholder = 'Paste from Sheets (H+J columns) or type:\n5597409248 | Hey John, your order is ready!\n5597409249 | Hi Sarah, just following up.';
+    Object.assign(pairedBox.style, { ...inputStyles, height: '100px', resize: 'vertical', lineHeight: '1.6' });
     pairedBox.addEventListener('focus', focusHandler);
-    pairedBox.addEventListener('blur', blurHandler);
+    pairedBox.addEventListener('blur',  blurHandler);
 
     const preview = document.createElement('div');
     preview.id = PREVIEW_ID;
@@ -458,28 +546,50 @@
     const btnRow = document.createElement('div');
     Object.assign(btnRow.style, { display: 'flex', gap: '8px', marginTop: '14px' });
 
-    const startBtn       = document.createElement('button');
+    const startBtn = document.createElement('button');
     startBtn.id          = START_BTN_ID;
     startBtn.type        = 'button';
     startBtn.textContent = 'Start Batch';
-    Object.assign(startBtn.style, { flex: '1', padding: '10px 14px', background: T.gold, color: T.pageBg, border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: '700', fontSize: '12px', letterSpacing: '0.02em', boxShadow: '0 2px 12px rgba(245, 197, 24, 0.2)' });
+    Object.assign(startBtn.style, {
+      flex: '1', padding: '8px 10px', background: T.cyanDim, color: '#fff',
+      border: `1px solid ${T.cyan}`, borderRadius: '4px', cursor: 'pointer',
+      fontFamily: "'DM Sans', sans-serif", fontWeight: '600', fontSize: '12px',
+      boxShadow: '0 2px 12px rgba(0,212,255,0.1)',
+    });
 
-    const stopBtn       = document.createElement('button');
+    const stopBtn = document.createElement('button');
     stopBtn.id          = STOP_BTN_ID;
     stopBtn.type        = 'button';
     stopBtn.textContent = 'Stop';
-    Object.assign(stopBtn.style, { width: '70px', padding: '10px', background: 'transparent', color: T.textMuted, border: `1px solid ${T.border}`, borderRadius: '8px', cursor: 'pointer', fontWeight: '600', fontSize: '12px' });
+    Object.assign(stopBtn.style, {
+      width: '70px', padding: '10px', background: T.pageBg,
+      color: T.textMuted, border: `1px solid ${T.border}`,
+      borderRadius: '4px', cursor: 'pointer', fontFamily: "'DM Sans', sans-serif", fontWeight: '600', fontSize: '12px',
+    });
 
-    const nextBtn       = document.createElement('button');
+    const nextBtn = document.createElement('button');
     nextBtn.id          = NEXT_BTN_ID;
     nextBtn.type        = 'button';
     nextBtn.textContent = 'Continue';
-    Object.assign(nextBtn.style, { marginTop: '8px', width: '100%', padding: '10px', background: T.goldDim, color: T.gold, border: `1px solid ${T.goldBorder}`, borderRadius: '8px', cursor: 'pointer', fontWeight: '600', fontSize: '12px', letterSpacing: '0.02em' });
+    nextBtn.disabled    = true;
+    Object.assign(nextBtn.style, {
+      marginTop: '8px', width: '100%', padding: '10px',
+      background: T.cyanHover, color: T.cyan, border: `1px solid ${T.cyanBorder}`,
+      borderRadius: '4px', cursor: 'not-allowed', fontFamily: "'DM Sans', sans-serif", fontWeight: '600',
+      fontSize: '12px', letterSpacing: '0.02em', opacity: '0.4',
+    });
 
     const status = document.createElement('div');
-    status.id    = STATUS_ID;
+    status.id = STATUS_ID;
     status.textContent = 'Ready';
-    Object.assign(status.style, { marginTop: '12px', color: T.textMuted, minHeight: '18px', fontSize: '11px', padding: '8px 10px', background: T.pageBg, borderRadius: '8px', border: `1px solid ${T.border}`, fontFamily: 'Monaco, "Courier New", monospace' });
+    Object.assign(status.style, {
+      marginTop: '12px', color: T.textMuted, minHeight: '18px', fontSize: '11px',
+      padding: '8px 10px', background: T.pageBg, borderRadius: '4px',
+      border: `1px solid ${T.border}`, fontFamily: "'DM Mono', monospace",
+    });
+
+    const failuresBox = document.createElement('div');
+    failuresBox.id = FAILURES_ID;
 
     btnRow.appendChild(startBtn);
     btnRow.appendChild(stopBtn);
@@ -490,6 +600,7 @@
     body.appendChild(btnRow);
     body.appendChild(nextBtn);
     body.appendChild(status);
+    body.appendChild(failuresBox);
 
     panel.appendChild(header);
     panel.appendChild(body);
@@ -522,8 +633,8 @@
   /* ---------- Tab switching ---------- */
   function switchTab(mode) {
     activeMode = mode;
-    const tabBatch  = document.getElementById(TAB_BATCH_ID);
-    const tabPaired = document.getElementById(TAB_PAIRED_ID);
+    const tabBatch   = document.getElementById(TAB_BATCH_ID);
+    const tabPaired  = document.getElementById(TAB_PAIRED_ID);
     const viewBatch  = document.getElementById(VIEW_BATCH_ID);
     const viewPaired = document.getElementById(VIEW_PAIRED_ID);
 
@@ -555,80 +666,86 @@
   }
 
   function parsePairs(raw) {
-  raw = (raw || '').replace(/\r/g, '');
-  const pairs = [];
-  const lines = raw.split('\n');
-  let i = 0;
+    raw = (raw || '').replace(/\r/g, '');
+    const pairs = [];
+    const lines  = raw.split('\n');
+    let i = 0;
 
-  const startsWithNumber = (line) => /^\s*"?\s*[\+\(\)\-\d][\d\s\-\+\(\)]{6,}/.test(line || '');
+    const startsWithNumber = (line) => /^\s*"?\s*[\+\(\)\-\d][\d\s\-\+\(\)]{6,}/.test(line || '');
 
-  while (i < lines.length) {
-    let line = lines[i];
-    if (!line || !line.replace(/["\s]/g, '')) { i++; continue; }
-    if (!startsWithNumber(line)) { throw new Error(`Paired parse error at line ${i + 1}: line does not start with a phone number.`); }
-
-    const tabIdx = line.indexOf('\t');
-    const pipeIdx = line.indexOf('|');
-    let num = '';
-    let msg = '';
-
-    if (tabIdx !== -1) {
-      const left = line.slice(0, tabIdx).trim();
-      let right = line.slice(tabIdx + 1);
-      num = digits(left);
-
-      const trimmedRight = right.trimStart();
-      const startsQuoted = trimmedRight.startsWith('"');
-
-      if (startsQuoted) {
-        let field = trimmedRight;
-        const isClosed = (s) => {
-          let inQuotes = false;
-          for (let k = 0; k < s.length; k++) {
-            if (s[k] === '"') {
-              const next = s[k + 1];
-              if (inQuotes && next === '"') { k++; } else { inQuotes = !inQuotes; }
-            }
-          }
-          return !inQuotes;
-        };
-
-        while (!isClosed(field)) {
-          i++;
-          if (i >= lines.length) break;
-          field += '\n' + lines[i];
-        }
-
-        if (!isClosed(field)) throw new Error(`Paired parse error: unterminated quoted message starting near line ${i + 1}.`);
-        field = field.trim();
-        if (!(field.startsWith('"') && field.endsWith('"'))) throw new Error(`Paired parse error near line ${i + 1}: quoted message not properly closed.`);
-        msg = field.slice(1, -1).replace(/""/g, '"');
-      } else {
-        msg = right.trim();
+    while (i < lines.length) {
+      let line = lines[i];
+      if (!line || !line.replace(/["\s]/g, '')) { i++; continue; }
+      if (!startsWithNumber(line)) {
+        throw new Error(`Paired parse error at line ${i + 1}: line does not start with a phone number.`);
       }
-    } else if (pipeIdx !== -1) {
-      num = digits(line.slice(0, pipeIdx).trim());
-      msg = line.slice(pipeIdx + 1).trim();
-      if (msg.startsWith('"') && msg.endsWith('"')) msg = msg.slice(1, -1).replace(/""/g, '"');
-    } else {
-      throw new Error(`Paired parse error at line ${i + 1}: missing tab separator. Copy columns J+K together from Sheets.`);
+
+      const tabIdx  = line.indexOf('\t');
+      const pipeIdx = line.indexOf('|');
+      let num = '';
+      let msg = '';
+
+      if (tabIdx !== -1) {
+        const left = line.slice(0, tabIdx).trim();
+        let right   = line.slice(tabIdx + 1);
+        num = digits(left);
+
+        const trimmedRight = right.trimStart();
+        const startsQuoted = trimmedRight.startsWith('"');
+
+        if (startsQuoted) {
+          let field = trimmedRight;
+          const isClosed = (s) => {
+            let inQuotes = false;
+            for (let k = 0; k < s.length; k++) {
+              if (s[k] === '"') {
+                const next = s[k + 1];
+                if (inQuotes && next === '"') { k++; } else { inQuotes = !inQuotes; }
+              }
+            }
+            return !inQuotes;
+          };
+
+          while (!isClosed(field)) {
+            i++;
+            if (i >= lines.length) break;
+            field += '\n' + lines[i];
+          }
+
+          if (!isClosed(field)) {
+            throw new Error(`Paired parse error: unterminated quoted message starting near line ${i + 1}.`);
+          }
+          field = field.trim();
+          if (!(field.startsWith('"') && field.endsWith('"'))) {
+            throw new Error(`Paired parse error near line ${i + 1}: quoted message not properly closed.`);
+          }
+          msg = field.slice(1, -1).replace(/""/g, '"');
+        } else {
+          msg = right.trim();
+        }
+      } else if (pipeIdx !== -1) {
+        num = digits(line.slice(0, pipeIdx).trim());
+        msg = line.slice(pipeIdx + 1).trim();
+        if (msg.startsWith('"') && msg.endsWith('"')) msg = msg.slice(1, -1).replace(/""/g, '"');
+      } else {
+        throw new Error(`Paired parse error at line ${i + 1}: missing tab separator. Copy columns J+K together from Sheets.`);
+      }
+
+      if (num.length < 7) throw new Error(`Paired parse error near line ${i + 1}: invalid number.`);
+      if (!msg)           throw new Error(`Paired parse error near line ${i + 1}: empty message for ${num}.`);
+
+      pairs.push({ number: num, message: msg });
+      i++;
     }
 
-    if (num.length < 7) throw new Error(`Paired parse error near line ${i + 1}: invalid number.`);
-    if (!msg) throw new Error(`Paired parse error near line ${i + 1}: empty message for ${num}.`);
+    const seen = new Set();
+    for (const p of pairs) {
+      if (seen.has(p.number)) throw new Error(`Paired parse error: duplicate number detected: ${p.number}`);
+      seen.add(p.number);
+    }
 
-    pairs.push({ number: num, message: msg });
-    i++;
+    return pairs;
   }
-
-  const seen = new Set();
-  for (const p of pairs) {
-    if (seen.has(p.number)) throw new Error(`Paired parse error: duplicate number detected: ${p.number}`);
-    seen.add(p.number);
-  }
-
-  return pairs;
-}
 
   /* ---------- Live preview ---------- */
   function updatePreview() {
@@ -638,7 +755,7 @@
     while (previewEl.firstChild) previewEl.removeChild(previewEl.firstChild);
 
     let pairs = [];
-    try { pairs = parsePairs(pairedBox.value); } catch(e) { /* ignore here, will surface on start */ }
+    try { pairs = parsePairs(pairedBox.value); } catch (e) { /* surface on start */ }
 
     if (pairs.length === 0) {
       const empty = document.createElement('span');
@@ -649,13 +766,12 @@
     }
 
     const maxShow = 20;
-    const header = document.createElement('div');
-    Object.assign(header.style, { color: T.info, marginBottom: '4px', fontSize: '9px', fontWeight: '600' });
-    header.textContent = `${pairs.length} pair${pairs.length !== 1 ? 's' : ''} found`;
-    previewEl.appendChild(header);
+    const hdr = document.createElement('div');
+    Object.assign(hdr.style, { color: T.info, marginBottom: '4px', fontSize: '9px', fontWeight: '600' });
+    hdr.textContent = `${pairs.length} pair${pairs.length !== 1 ? 's' : ''} found`;
+    previewEl.appendChild(hdr);
 
-    const show = pairs.slice(0, maxShow);
-    for (const p of show) {
+    for (const p of pairs.slice(0, maxShow)) {
       const numDisplay = p.number.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3');
       const firstLine  = p.message.split('\n')[0];
       const msgShort   = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
@@ -664,15 +780,15 @@
       row.className = 'pair-row';
 
       const numSpan = document.createElement('span');
-      numSpan.className = 'pair-num';
+      numSpan.className   = 'pair-num';
       numSpan.textContent = numDisplay;
 
       const arrow = document.createElement('span');
-      arrow.className = 'pair-arrow';
+      arrow.className   = 'pair-arrow';
       arrow.textContent = '→';
 
       const msgSpan = document.createElement('span');
-      msgSpan.className = 'pair-msg';
+      msgSpan.className   = 'pair-msg';
       msgSpan.textContent = msgShort;
 
       row.appendChild(numSpan);
@@ -692,24 +808,36 @@
   /* ---------- Reset to main view ---------- */
   async function resetToMainView() {
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (!composerIsVisible() && !deepFind(el => el.tagName === 'INPUT' && el.offsetParent !== null && el.closest('[data-e2e-new-conversation], [role="dialog"]'))) {
+      if (
+        !composerIsVisible() &&
+        !deepFind(el => el.tagName === 'INPUT' && el.offsetParent !== null &&
+          el.closest('[data-e2e-new-conversation], [role="dialog"]'))
+      ) {
         await sleep(50);
         return;
       }
       for (const target of [document.activeElement, document.body, document]) {
         if (!target) continue;
-        target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true,
+        }));
       }
       await sleep(80);
 
       const closeBtn = deepFind(el =>
         (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') &&
-        (/back|close|cancel|dismiss/i.test(el.getAttribute('aria-label') || '') || el.querySelector('[data-mat-icon-name="arrow_back"], [data-mat-icon-name="close"]'))
+        (/back|close|cancel|dismiss/i.test(el.getAttribute('aria-label') || '') ||
+         el.querySelector('[data-mat-icon-name="arrow_back"], [data-mat-icon-name="close"]'))
       );
       if (closeBtn) {
         strongClick(closeBtn);
-        try { await waitFor(() => !composerIsVisible(), { timeout: 2000, interval: 30, label: 'close conversation' }); return; } catch { }
-      } else { await sleep(100); }
+        try {
+          await waitFor(() => !composerIsVisible(), { timeout: 2000, interval: 30, label: 'close conversation' });
+          return;
+        } catch { }
+      } else {
+        await sleep(100);
+      }
     }
     await sleep(100);
   }
@@ -719,13 +847,19 @@
     input.focus();
     setVal(input, '');
     input.select?.();
-    input.dispatchEvent(new KeyboardEvent('keydown',  { key: 'Backspace', code: 'Backspace', keyCode: 8, bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup',    { key: 'Backspace', code: 'Backspace', keyCode: 8, bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', keyCode: 8, bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Backspace', code: 'Backspace', keyCode: 8, bubbles: true }));
     setVal(input, '');
     setVal(input, phone);
 
     try {
-      await waitFor(() => deepFind(el => (el.getAttribute('role') === 'listbox' || el.getAttribute('role') === 'option' || el.classList.contains('autocomplete-list') || el.classList.contains('suggestion')) && el.offsetParent !== null), { timeout: 1000, interval: 30, label: 'contact suggestions' });
+      await waitFor(() =>
+        deepFind(el =>
+          (el.getAttribute('role') === 'listbox' || el.getAttribute('role') === 'option' ||
+           el.classList.contains('autocomplete-list') || el.classList.contains('suggestion')) &&
+          el.offsetParent !== null
+        ), { timeout: 1000, interval: 30, label: 'contact suggestions' }
+      );
     } catch { await sleep(50); }
   }
 
@@ -733,28 +867,39 @@
     const MAX_CONTACT_ATTEMPTS = 3;
     for (let attempt = 1; attempt <= MAX_CONTACT_ATTEMPTS; attempt++) {
       setStatus(`${tag} Selecting contact (attempt ${attempt})…`);
-      ['keydown','keypress','keyup'].forEach(type => { input.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })); });
+      ['keydown', 'keypress', 'keyup'].forEach(type => {
+        input.dispatchEvent(new KeyboardEvent(type, {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+        }));
+      });
 
       const candidatePred = (el) => {
-        const txt   = (el.textContent || '').trim();
-        const aria  = (el.getAttribute('aria-label') || '').trim();
-        const combined  = (txt + ' ' + aria).toLowerCase();
-        const hasDigits = digits(txt).includes(phoneDigits) || digits(aria).includes(phoneDigits);
+        const txt      = (el.textContent || '').trim();
+        const aria     = (el.getAttribute('aria-label') || '').trim();
+        const combined = (txt + ' ' + aria).toLowerCase();
+        const hasDigits     = digits(txt).includes(phoneDigits) || digits(aria).includes(phoneDigits);
         const looksLikeSendTo = /send to/i.test(combined);
-        const isOption   = el.getAttribute('role') === 'option';
-        const isButtonish = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tagName === 'LI' || el.tagName === 'DIV';
+        const isOption        = el.getAttribute('role') === 'option';
+        const isButtonish     = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tagName === 'LI' || el.tagName === 'DIV';
         return el.offsetParent !== null && isButtonish && (hasDigits || looksLikeSendTo || isOption);
       };
 
       let contact = null;
-      try { contact = await waitFor(() => deepFind(candidatePred), { timeout: 1500, interval: 40, label: 'contact dropdown' }); } catch { }
+      try {
+        contact = await waitFor(() => deepFind(candidatePred), { timeout: 1500, interval: 40, label: 'contact dropdown' });
+      } catch { }
 
-      if (contact) { strongClick(contact); } else {
+      if (contact) {
+        strongClick(contact);
+      } else {
         input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
         input.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
       }
 
-      try { await waitFor(() => composerIsVisible(), { timeout: 3000, interval: 40, label: 'composer after contact select' }); return true; } catch { }
+      try {
+        await waitFor(() => composerIsVisible(), { timeout: 3000, interval: 40, label: 'composer after contact select' });
+        return true;
+      } catch { }
 
       if (attempt < MAX_CONTACT_ATTEMPTS) {
         setStatus(`${tag} Conversation didn't open, retrying…`);
@@ -762,7 +907,9 @@
         const startBtn = findStartChatButton();
         if (startBtn) {
           strongClick(startBtn);
-          try { input = await waitFor(() => findNumberInput(), { timeout: 3000, interval: 40, label: 'number input retry' }); } catch { }
+          try {
+            input = await waitFor(() => findNumberInput(), { timeout: 3000, interval: 40, label: 'number input retry' });
+          } catch { }
         }
         await clearAndSetInput(input, phone);
       }
@@ -771,13 +918,17 @@
   }
 
   /* ---------- Pre-extract message content once per batch (batch mode) ---------- */
-  let _cachedText = null;
-  let _cachedImageBlobs = null;
+  let _cachedText        = null;
+  let _cachedImageBlobs  = null;
 
   function extractMessageContent() {
     const richBox = document.getElementById(MSG_ID);
     let text = '';
-    const walker = document.createTreeWalker(richBox, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, { acceptNode: (node) => (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'IMG') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+    const walker = document.createTreeWalker(
+      richBox,
+      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+      { acceptNode: (node) => (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'IMG') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT }
+    );
     let node; let lastWasBR = false;
     while ((node = walker.nextNode())) {
       if (node.nodeType === Node.TEXT_NODE) {
@@ -800,10 +951,11 @@
 
   async function ensureImageBlobs() {
     if (_cachedImageBlobs !== null) return _cachedImageBlobs;
-    const richBox = document.getElementById(MSG_ID);
-    const imgs = richBox.querySelectorAll('img');
-    _cachedImageBlobs = [];
-    const promises = Array.from(imgs).map(async (img) => { try { const res  = await fetch(img.src); return await res.blob(); } catch (e) { return null; } });
+    const richBox  = document.getElementById(MSG_ID);
+    const imgs     = richBox.querySelectorAll('img');
+    const promises = Array.from(imgs).map(async (img) => {
+      try { const res = await fetch(img.src); return await res.blob(); } catch { return null; }
+    });
     _cachedImageBlobs = (await Promise.all(promises)).filter(Boolean);
     return _cachedImageBlobs;
   }
@@ -817,7 +969,12 @@
       document.execCommand('selectAll', false, null);
       document.execCommand('delete', false, null);
       const inserted = document.execCommand('insertText', false, textToSend);
-      if (!inserted) setVal(composer, textToSend);
+      if (!inserted || !composer.value) {
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+        if (nativeSetter) nativeSetter.call(composer, textToSend);
+        else composer.value = textToSend;
+        composer.dispatchEvent(new Event('input', { bubbles: true }));
+      }
       await sleep(100);
     }
     if (textOverride === null) {
@@ -832,20 +989,53 @@
     }
   }
 
-  /* ---------- Confirmation logic ---------- */
-  async function waitForSendConfirmation({ composer, sendBtn }) {
+  async function waitForSendConfirmation({ composer, sendBtn, expectedText, outgoingCountBefore = 0 }) {
     const deadline = Date.now() + SEND_CONFIRM_TIMEOUTMS;
+
     while (waitingForNext && Date.now() < deadline) {
       if (stopRequested) throw new Error('Stopped');
-      if (isComposerFlushed(composer)) { await sleep(CONFIRM_GRACE_MS); if (isComposerFlushed(composer)) return true; }
-      const currentSendBtn = cachedDeepFind('sendBtn', isSendButton);
-      if (!currentSendBtn || currentSendBtn.disabled) {
-        await sleep(200);
-        if (isComposerFlushed(composer)) return true;
-        if (!hasAttachment()) return true;
+
+      const flushed = isComposerFlushed(composer);
+
+      if (flushed) {
+        await sleep(CONFIRM_GRACE_MS);
+        if (!isComposerFlushed(composer)) {
+          await sleep(80);
+          continue;
+        }
+
+        setNextButtonEnabled(true);
+        updatePillIndicator();
+
+        const confirmDeadline = Date.now() + POSITIVE_CONFIRM_MS;
+        let positiveConfirmed = false;
+        while (Date.now() < confirmDeadline) {
+          if (messageSentInThread(expectedText, outgoingCountBefore)) { positiveConfirmed = true; break; }
+          await sleep(80);
+        }
+
+        if (positiveConfirmed) {
+          waitingForNext = false;
+          setNextButtonEnabled(false);
+          updatePillIndicator();
+          return true;
+        }
+
+        if (!waitingForNext) {
+          setNextButtonEnabled(false);
+          return true;
+        }
       }
+
+      if (!waitingForNext) {
+        setNextButtonEnabled(false);
+        return true;
+      }
+
       await sleep(80);
     }
+
+    setNextButtonEnabled(false);
     return false;
   }
 
@@ -853,7 +1043,10 @@
   async function prepAndWaitSend(phone, index, total, textOverride = null) {
     const tag         = `[${index + 1}/${total}]`;
     const phoneDigits = digits(phone);
-    _deepFindCache.delete('composer'); _deepFindCache.delete('sendBtn'); _deepFindCache.delete('startChat');
+    _deepFindCache.delete('composer');
+    _deepFindCache.delete('sendBtn');
+    _deepFindCache.delete('startChat');
+
     await resetToMainView();
 
     setStatus(`${tag} Opening chat…`);
@@ -870,38 +1063,43 @@
     setStatus(`${tag} Finding composer…`);
     const composer = await waitFor(() => cachedDeepFind('composer', isComposerTextarea), { timeout: 3000, interval: 30, label: 'composer' });
 
-    setVal(composer, '');
     composer.focus();
-    document.execCommand('selectAll', false, null);
-    document.execCommand('delete', false, null);
 
     setStatus(`${tag} Pasting content…`);
     await transferContent(composer, textOverride);
 
     const sendBtn = await waitFor(() => cachedDeepFind('sendBtn', isSendButton), { timeout: 3000, interval: 30, label: 'send button' });
-    sendBtn.style.outline       = `3px solid ${T.gold}`;
+    sendBtn.style.outline       = `3px solid ${T.cyan}`;
     sendBtn.style.outlineOffset = '2px';
     sendBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
-    setStatus(`${tag} Click Send. Waiting…`);
+    setStatus(`${tag} Click Send. Waiting for confirmation…`);
+
+    const expectedText = textOverride !== null ? textOverride : _cachedText;
+    const outgoingCountBefore = document.querySelectorAll('[data-e2e-message-outgoing]').length;
+
     waitingForNext = true;
+    setNextButtonEnabled(false);
     updatePillIndicator();
     await sleep(150);
 
-    const confirmed = await waitForSendConfirmation({ composer, sendBtn });
+    const confirmed = await waitForSendConfirmation({ composer, sendBtn, expectedText, outgoingCountBefore });
     waitingForNext = false;
+    setNextButtonEnabled(false);
     updatePillIndicator();
     sendBtn.style.outline       = '';
     sendBtn.style.outlineOffset = '';
 
     if (!confirmed) throw new Error('Send timed out — could not confirm send. Will retry.');
     await sleep(300);
-    setStatus(`${tag} Done, moving on…`);
+    setStatus(`${tag} Confirmed sent, moving on…`);
   }
 
   /* ---------- Shared retry runner helpers ---------- */
   function formatFailedList(failedItems) {
-    return failedItems.map(f => `${f.number}\t${(f.message || '').split('\n')[0].slice(0, 120)}`).join('\n');
+    return failedItems
+      .map(f => `${f.number}\t${(f.message || '').split('\n')[0].slice(0, 120)}`)
+      .join('\n');
   }
 
   async function attemptSendWithRetries({ number, message, index, total, modeLabel }) {
@@ -916,6 +1114,7 @@
         lastErr = e;
         console.error('[BatchSender] attempt failed', attempt, number, e);
         waitingForNext = false;
+        setNextButtonEnabled(false);
         updatePillIndicator();
         await resetToMainView();
         await sleep(500);
@@ -936,15 +1135,22 @@
         if (stopRequested) break;
         const item = remaining[i];
 
-        // Double check signature right before retry just in case
-        const sig = getSignature(item.number, item.message || _cachedText);
+        const sigText = item.message !== null ? item.message : item.capturedText;
+        const sig = getSignature(item.number, sigText);
         if (sessionSentRegistry.has(sig)) continue;
 
-        const result = await attemptSendWithRetries({ number: item.number, message: item.message ?? null, index: i, total: remaining.length, modeLabel: 'Retry' });
+        const result = await attemptSendWithRetries({
+          number:    item.number,
+          message:   item.message ?? null,
+          index:     i,
+          total:     remaining.length,
+          modeLabel: 'Retry',
+        });
+
         if (result.ok) {
-           sessionSentRegistry.add(sig);
+          sessionSentRegistry.add(sig);
         } else {
-           nextRemaining.push({ ...item, error: result.error });
+          nextRemaining.push({ ...item, error: result.error });
         }
       }
       remaining = nextRemaining.slice();
@@ -957,32 +1163,41 @@
     stopRequested  = false;
     waitingForNext = false;
     toggleRunState(true);
+    showFailuresInUI([]);
 
     const hasImages = extractMessageContent();
     if (hasImages) { setStatus('Pre-loading images…'); await ensureImageBlobs(); }
+
+    const batchTextSnapshot = _cachedText;
 
     let successCount = 0; let failCount = 0; let skipCount = 0;
     const failed = [];
 
     for (let i = 0; i < numbers.length; i++) {
       if (stopRequested) { setStatus('Stopped.'); break; }
-      const num = numbers[i];
-      const msgSig = getSignature(num, _cachedText);
+      const num    = numbers[i];
+      const msgSig = getSignature(num, batchTextSnapshot);
 
-      // Strict session duplicate check
       if (sessionSentRegistry.has(msgSig)) {
         skipCount++;
-        setStatus(`[${i + 1}/${numbers.length}] Skipping ${num} (already sent this exact message).`);
+        setStatus(`[${i + 1}/${numbers.length}] Skipping ${num} (already sent this session).`);
         continue;
       }
 
-      const result = await attemptSendWithRetries({ number: num, message: null, index: i, total: numbers.length, modeLabel: 'Batch' });
+      const result = await attemptSendWithRetries({
+        number:    num,
+        message:   null,
+        index:     i,
+        total:     numbers.length,
+        modeLabel: 'Batch',
+      });
+
       if (result.ok) {
         sessionSentRegistry.add(msgSig);
         successCount++;
       } else {
         failCount++;
-        failed.push({ number: num, message: null, error: result.error });
+        failed.push({ number: num, message: null, capturedText: batchTextSnapshot, error: result.error });
         setStatus(`Error on ${num}: ${result.error}`);
       }
     }
@@ -990,15 +1205,9 @@
     if (!stopRequested && failed.length) {
       setStatus(`Initial run done. Retrying ${failed.length} failed…`);
       const remaining = await retryFailuresPostRun(failed, 'Batch');
-      const finalFailCount = remaining.length;
-      successCount += (failed.length - finalFailCount);
-      failCount = finalFailCount;
-      if (remaining.length) {
-        console.group('[BatchSender] FINAL FAILURES (Batch)');
-        console.table(remaining);
-        console.log('Copy/paste list (numbers):\n' + remaining.map(x => x.number).join('\n'));
-        console.groupEnd();
-      }
+      successCount += (failed.length - remaining.length);
+      failCount     = remaining.length;
+      if (remaining.length) showFailuresInUI(remaining);
     }
 
     const parts = [`${successCount} sent`, `${failCount} failed`];
@@ -1012,6 +1221,7 @@
     stopRequested  = false;
     waitingForNext = false;
     toggleRunState(true);
+    showFailuresInUI([]);
 
     _cachedText = null; _cachedImageBlobs = [];
     let successCount = 0; let failCount = 0; let skipCount = 0;
@@ -1024,38 +1234,40 @@
       const nameTag   = nameMatch ? nameMatch[1] : number;
       const msgSig    = getSignature(number, message);
 
-      // Strict session duplicate check
       if (sessionSentRegistry.has(msgSig)) {
         skipCount++;
-        setStatus(`[${i + 1}/${pairs.length}] Skipping ${nameTag} (already sent this exact message).`);
+        setStatus(`[${i + 1}/${pairs.length}] Skipping ${nameTag} (already sent this session).`);
         continue;
       }
 
-      const result = await attemptSendWithRetries({ number, message, index: i, total: pairs.length, modeLabel: 'Paired' });
+      const result = await attemptSendWithRetries({
+        number,
+        message,
+        index:     i,
+        total:     pairs.length,
+        modeLabel: 'Paired',
+      });
+
       if (result.ok) {
         sessionSentRegistry.add(msgSig);
         successCount++;
         setStatus(`[${i + 1}/${pairs.length}] ✓ Sent to ${nameTag}`);
       } else {
         failCount++;
-        failedPairs.push({ index: i + 1, name: nameTag, number, message, error: result.error });
+        failedPairs.push({ index: i + 1, name: nameTag, number, message, capturedText: message, error: result.error });
         setStatus(`[${i + 1}/${pairs.length}] ✗ FAILED: ${nameTag} — ${result.error}`);
       }
     }
 
     if (!stopRequested && failedPairs.length) {
       setStatus(`Initial run done. Retrying ${failedPairs.length} failed…`);
-      const remaining = await retryFailuresPostRun(failedPairs.map(f => ({ number: f.number, message: f.message, name: f.name, index: f.index, error: f.error })), 'Paired');
-      const finalFailCount = remaining.length;
-      successCount += (failedPairs.length - finalFailCount);
-      failCount = finalFailCount;
-
-      if (remaining.length) {
-        console.group('[BatchSender] FINAL FAILURES (Paired)');
-        console.table(remaining);
-        console.log('Copy/paste list (number<TAB>first-line-of-message):\n' + formatFailedList(remaining));
-        console.groupEnd();
-      }
+      const remaining = await retryFailuresPostRun(
+        failedPairs.map(f => ({ number: f.number, message: f.message, capturedText: f.capturedText, name: f.name, index: f.index, error: f.error })),
+        'Paired'
+      );
+      successCount += (failedPairs.length - remaining.length);
+      failCount     = remaining.length;
+      if (remaining.length) showFailuresInUI(remaining);
     }
 
     const parts = [`${successCount} sent`, `${failCount} failed`];
@@ -1077,17 +1289,18 @@
     const minBtn    = document.getElementById(MIN_BTN_ID);
     const pill      = document.getElementById(PILL_ID);
 
-    tabBatch.addEventListener('click', () => switchTab('batch'));
+    tabBatch.addEventListener('click',  () => switchTab('batch'));
     tabPaired.addEventListener('click', () => switchTab('paired'));
 
     minBtn.addEventListener('click', () => setMinimized(true));
-    pill.addEventListener('click', () => setMinimized(false));
-    pill.addEventListener('keydown', (e) => {
+    pill.addEventListener('click',   () => setMinimized(false));
+    pill.addEventListener('keydown',  (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMinimized(false); }
     });
 
     startBtn.addEventListener('click', () => {
       if (isRunning) return;
+
       if (activeMode === 'batch') {
         const nums = parseNumbers(numsBox.value);
         if (!nums.length) return setStatus('Add at least one valid number (7+ digits).');
@@ -1095,7 +1308,12 @@
         setStatus('Starting batch…');
         runBatch(nums);
       } else {
-        const pairs = parsePairs(pairedBox.value);
+        let pairs;
+        try {
+          pairs = parsePairs(pairedBox.value);
+        } catch (e) {
+          return setStatus(`Parse error: ${e.message}`);
+        }
         if (!pairs.length) return setStatus('No valid pairs found. Check your paste or format.');
         setStatus(`Starting paired send (${pairs.length} pairs)…`);
         runPaired(pairs);
@@ -1106,12 +1324,16 @@
       if (!isRunning && !waitingForNext) return;
       stopRequested  = true;
       waitingForNext = false;
+      setNextButtonEnabled(false);
       setStatus('Stop requested…');
       toggleRunState(false);
     });
 
     nextBtn.addEventListener('click', () => {
+      if (nextBtn.disabled) return;
+      if (!waitingForNext) return;
       waitingForNext = false;
+      setNextButtonEnabled(false);
       updatePillIndicator();
       setStatus('Continuing…');
     });
