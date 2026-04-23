@@ -37,9 +37,6 @@
   const MAX_TRIES_PER_NUMBER   = 2;
   const MAX_POST_RUN_PASSES    = 1;
   const SEND_CONFIRM_TIMEOUTMS = 300000;
-  const CONFIRM_GRACE_MS       = 350;
-  // How long to scan the thread for positive confirmation after composer clears
-  const POSITIVE_CONFIRM_MS    = 4000;
 
   let stopRequested  = false;
   let waitingForNext = false;
@@ -245,37 +242,6 @@
 
   function hasAttachment() {
     return !!document.querySelector('mw-attachment-view, [data-e2e-attached-media]');
-  }
-
-  function isComposerFlushed(composer) {
-    const composerEmpty = !((composer?.value || '').trim());
-    const noAttachment  = !hasAttachment();
-    return composerEmpty && noAttachment;
-  }
-
-  function getLastOutgoingMessageText() {
-    const all = [];
-    const walk = (root) => {
-      root.querySelectorAll('[data-e2e-message-outgoing]').forEach(wrapper => {
-        const textEl = wrapper.querySelector('[data-e2e-text-message-content]');
-        if (textEl) all.push(textEl.textContent.trim());
-        if (wrapper.shadowRoot) walk(wrapper.shadowRoot);
-      });
-    };
-    walk(document);
-    return all.length ? all[all.length - 1] : null;
-  }
-
-  function messageSentInThread(expectedTextSnippet, outgoingCountBefore) {
-    if (!expectedTextSnippet) {
-      return document.querySelectorAll('[data-e2e-message-outgoing]').length > outgoingCountBefore;
-    }
-    const currentCount = document.querySelectorAll('[data-e2e-message-outgoing]').length;
-    if (currentCount <= outgoingCountBefore) return false;
-    const lastText = getLastOutgoingMessageText();
-    if (!lastText) return false;
-    const snippet = expectedTextSnippet.trim().slice(0, 40).toLowerCase();
-    return lastText.toLowerCase().includes(snippet);
   }
 
   function findNumberInput() {
@@ -989,55 +955,35 @@
     }
   }
 
-  async function waitForSendConfirmation({ composer, sendBtn, expectedText, outgoingCountBefore = 0 }) {
-    const deadline = Date.now() + SEND_CONFIRM_TIMEOUTMS;
+  async function waitForSendConfirmation({ outgoingCountBefore = 0 }) {
+  const deadline = Date.now() + SEND_CONFIRM_TIMEOUTMS;
 
-    while (waitingForNext && Date.now() < deadline) {
+  // Step 1: wait for new outgoing bubble to appear
+  let newestBubble = null;
+  await waitFor(
+    () => {
       if (stopRequested) throw new Error('Stopped');
+      const bubbles = document.querySelectorAll('[data-e2e-message-outgoing]');
+      if (bubbles.length <= outgoingCountBefore) return false;
+      newestBubble = bubbles[bubbles.length - 1];
+      return true;
+    },
+    { timeout: SEND_CONFIRM_TIMEOUTMS, interval: 80, label: 'new outgoing bubble' }
+  );
 
-      const flushed = isComposerFlushed(composer);
+  // Step 2: wait for aria-label on mws-text-message-part to confirm sent/delivered
+  await waitFor(
+    () => {
+      if (stopRequested) throw new Error('Stopped');
+      const part = newestBubble?.querySelector('mws-text-message-part');
+      const label = part?.getAttribute('aria-label') || '';
+      return /Sent on|Delivered/i.test(label);
+    },
+    { timeout: 30000, interval: 200, label: 'sent/delivered confirmation' }
+  );
 
-      if (flushed) {
-        await sleep(CONFIRM_GRACE_MS);
-        if (!isComposerFlushed(composer)) {
-          await sleep(80);
-          continue;
-        }
-
-        setNextButtonEnabled(true);
-        updatePillIndicator();
-
-        const confirmDeadline = Date.now() + POSITIVE_CONFIRM_MS;
-        let positiveConfirmed = false;
-        while (Date.now() < confirmDeadline) {
-          if (messageSentInThread(expectedText, outgoingCountBefore)) { positiveConfirmed = true; break; }
-          await sleep(80);
-        }
-
-        if (positiveConfirmed) {
-          waitingForNext = false;
-          setNextButtonEnabled(false);
-          updatePillIndicator();
-          return true;
-        }
-
-        if (!waitingForNext) {
-          setNextButtonEnabled(false);
-          return true;
-        }
-      }
-
-      if (!waitingForNext) {
-        setNextButtonEnabled(false);
-        return true;
-      }
-
-      await sleep(80);
-    }
-
-    setNextButtonEnabled(false);
-    return false;
-  }
+  return true;
+}
 
   /* ---------- Main per-number flow ---------- */
   async function prepAndWaitSend(phone, index, total, textOverride = null) {
@@ -1075,31 +1021,19 @@
 
     setStatus(`${tag} Click Send. Waiting for confirmation…`);
 
-    const expectedText = textOverride !== null ? textOverride : _cachedText;
     const outgoingCountBefore = document.querySelectorAll('[data-e2e-message-outgoing]').length;
 
-    waitingForNext = true;
     setNextButtonEnabled(false);
     updatePillIndicator();
-    await sleep(150);
 
-    const confirmed = await waitForSendConfirmation({ composer, sendBtn, expectedText, outgoingCountBefore });
+    const confirmed = await waitForSendConfirmation({ outgoingCountBefore });
     waitingForNext = false;
-    setNextButtonEnabled(false);
-    updatePillIndicator();
     sendBtn.style.outline       = '';
     sendBtn.style.outlineOffset = '';
 
     if (!confirmed) throw new Error('Send timed out — could not confirm send. Will retry.');
     await sleep(300);
     setStatus(`${tag} Confirmed sent, moving on…`);
-  }
-
-  /* ---------- Shared retry runner helpers ---------- */
-  function formatFailedList(failedItems) {
-    return failedItems
-      .map(f => `${f.number}\t${(f.message || '').split('\n')[0].slice(0, 120)}`)
-      .join('\n');
   }
 
   async function attemptSendWithRetries({ number, message, index, total, modeLabel }) {
