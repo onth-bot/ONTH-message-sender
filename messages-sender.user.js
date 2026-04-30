@@ -1,23 +1,40 @@
 // ==UserScript==
 // @name         Messages Sender
 // @namespace    http://tampermonkey.net/
-// @version      4.7
-// @description  Batch-prep chats: handles numbers, text, and images. Premium gold-on-black UI. Strict session-level duplicate prevention for both modes. Prevents button spam. Minimizable. v4.7: positive send confirmation using live-DOM-confirmed selectors (data-e2e-message-outgoing + data-e2e-text-message-content).
+// @version      6.2
+// @description  Batch-prep chats. v6.2: persistent 24hr no-double-send registry + avlg-bot shared UI.
 // @author       You
 // @match        https://messages.google.com/*
+// @require      https://cdn.jsdelivr.net/gh/onth-bot/dsp-shared-ui@main/dsp-ui-core.js
 // @downloadURL  https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
 // @updateURL    https://raw.githubusercontent.com/onth-bot/ONTH-message-sender/main/messages-sender.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
+
 (() => {
   'use strict';
   if (window.top !== window.self) return;
 
+  const T = (window.DSP_UI && window.DSP_UI.theme) ? window.DSP_UI.theme : {
+    accent: '#00d4ff', accent2: '#40e4ff', accentDim: '#006e85',
+    bg: '#070a0f', card: '#101722', text: '#e8edf5', textMuted: '#8b98aa',
+    border: '#243044', success: '#22d98a', warning: '#ffb020', danger: '#ff4d6a',
+    fontBody: "'DM Sans', sans-serif", fontDisplay: "'Bebas Neue', Impact, sans-serif",
+    fontMono: "'DM Mono', monospace",
+  };
+
+  const C = {
+    pageBg: T.bg, panelBg: T.card, cardBg: T.card, border: T.border,
+    cyan: T.accent, cyanDim: T.accentDim, cyanBorder: 'rgba(0,212,255,.25)',
+    cyanHover: 'rgba(0,212,255,.10)', textPrimary: T.text, textBody: T.text,
+    textMuted: T.textMuted, danger: T.danger, dangerBg: 'rgba(255,77,106,.10)',
+    warning: T.warning, success: T.success, info: T.accent2,
+  };
+
   const PANEL_ID       = '__gm_batch_panel';
   const START_BTN_ID   = '__gm_batch_start';
   const STOP_BTN_ID    = '__gm_batch_stop';
-  const NEXT_BTN_ID    = '__gm_batch_next';
   const NUMS_ID        = '__gm_batch_numbers';
   const MSG_ID         = '__gm_batch_message';
   const STATUS_ID      = '__gm_batch_status';
@@ -31,597 +48,601 @@
   const MIN_BTN_ID     = '__gm_batch_minimize';
   const PILL_ID        = '__gm_batch_pill';
   const PILL_STATUS_ID = '__gm_batch_pill_status';
-  const BODY_ID        = '__gm_batch_body';
 
-  // -------- Reliability knobs --------
-  const MAX_TRIES_PER_NUMBER   = 2;
-  const MAX_POST_RUN_PASSES    = 1;
-  const SEND_CONFIRM_TIMEOUTMS = 300000;
+  const SENT_KEY = '__gm_batch_sent_registry_v2';
+  const DEDUPE_HOURS = 24;
+  const MAX_SENT_KEYS = 2000;
 
-  let stopRequested  = false;
-  let waitingForNext = false;
-  let isRunning      = false;
-  let activeMode     = 'batch';
-  let isMinimized    = false;
+  let stopRequested = false;
+  let isRunning = false;
+  let activeMode = 'batch';
+  let isMinimized = false;
 
-  // Strict session registry: tracks "number|message_snippet" to prevent ANY double sends in one session.
-  const sessionSentRegistry = new Set();
+  const sleep  = ms => new Promise(r => setTimeout(r, ms));
+  const digits = s  => (s || '').replace(/\D+/g, '');
 
-  const getSignature = (num, msg) => `${num}|${(msg || '').trim().slice(0, 50)}`;
-
-  const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
-  const digits = (s)  => (s || '').replace(/\D+/g, '');
-
-  /* ---------- Theme tokens (Glass-Dark Logistics) ---------- */
-  const T = {
-    pageBg:      '#080a0d',
-    panelBg:     '#111520',
-    cardBg:      '#111520',
-    border:      '#1e2535',
-    cyan:        '#00d4ff',
-    cyanDim:     '#006e85',
-    cyanBorder:  'rgba(0, 212, 255, 0.25)',
-    cyanHover:   'rgba(0, 212, 255, 0.15)',
-    textPrimary: '#e8edf5',
-    textBody:    '#e8edf5',
-    textMuted:   '#4a5568',
-    danger:      '#ff4d6a',
-    dangerBg:    'rgba(255,77,106,0.1)',
-    warning:     '#ffb020',
-    warningBg:   'rgba(255,176,32,0.1)',
-    success:     '#22d98a',
-    successBg:   'rgba(34,217,138,0.1)',
-    info:        '#40e4ff',
-  };
-
-  /* ---------- Core polling helper ---------- */
-  async function waitFor(conditionFn, { timeout = 8000, interval = 40, label = 'condition' } = {}) {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      const result = conditionFn();
-      if (result) return result;
-      await sleep(interval);
-    }
-    throw new Error(`${label}: timed out after ${timeout}ms`);
+  function normalizeMsg(msg) {
+    return String(msg || '').trim().replace(/\s+/g, ' ');
   }
 
-  /* ---------- DOM helpers ---------- */
-  const deepFind = (pred, roots = [document]) => {
-    const seen = new WeakSet();
-    const walk = (root) => {
-      if (!root) return null;
-      const all = root.querySelectorAll('*');
-      for (const el of all) {
-        if (seen.has(el)) continue;
-        seen.add(el);
-        if (pred(el)) return el;
-        if (el.shadowRoot) {
-          const hit = walk(el.shadowRoot);
-          if (hit) return hit;
-        }
-      }
-      return null;
-    };
-    for (const r of roots) {
-      const hit = walk(r);
-      if (hit) return hit;
+  function getSignature(num, msg) {
+    return `${digits(num)}|${normalizeMsg(msg)}`;
+  }
+
+  function loadSentRegistry() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(SENT_KEY) || '{}');
+      const now = Date.now();
+      const maxAge = DEDUPE_HOURS * 60 * 60 * 1000;
+      const clean = {};
+
+      Object.entries(raw).forEach(([sig, ts]) => {
+        if (typeof ts === 'number' && now - ts <= maxAge) clean[sig] = ts;
+      });
+
+      localStorage.setItem(SENT_KEY, JSON.stringify(clean));
+      return clean;
+    } catch {
+      return {};
     }
-    return null;
+  }
+
+  let sentRegistry = loadSentRegistry();
+
+  function saveSentRegistry() {
+    const entries = Object.entries(sentRegistry)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_SENT_KEYS);
+
+    sentRegistry = Object.fromEntries(entries);
+    localStorage.setItem(SENT_KEY, JSON.stringify(sentRegistry));
+  }
+
+  function wasSent(num, msg) {
+    const sig = getSignature(num, msg);
+    const ts = sentRegistry[sig];
+    if (!ts) return false;
+
+    const maxAge = DEDUPE_HOURS * 60 * 60 * 1000;
+    if (Date.now() - ts > maxAge) {
+      delete sentRegistry[sig];
+      saveSentRegistry();
+      return false;
+    }
+
+    return true;
+  }
+
+  function markSent(num, msg) {
+    sentRegistry[getSignature(num, msg)] = Date.now();
+    saveSentRegistry();
+  }
+
+  window.GM_BATCH_SENDER = {
+    clearSentMemory() {
+      sentRegistry = {};
+      localStorage.removeItem(SENT_KEY);
+      console.log('✅ GM Batch Sender sent-memory cleared.');
+    },
+    sentMemoryCount() {
+      return Object.keys(sentRegistry).length;
+    }
   };
 
-  const _deepFindCache = new Map();
-  const cachedDeepFind = (key, pred, roots) => {
-    const cached = _deepFindCache.get(key);
-    if (cached && cached.isConnected && pred(cached)) return cached;
-    const found = deepFind(pred, roots);
-    if (found) _deepFindCache.set(key, found);
-    else _deepFindCache.delete(key);
-    return found;
+  async function waitFor(fn, { timeout = 8000, interval = 50, label = '' } = {}) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (stopRequested) throw new Error('Stopped');
+      const r = fn();
+      if (r) return r;
+      await sleep(interval);
+    }
+    throw new Error(`waitFor timeout: ${label}`);
+  }
+
+  const onNewPage = () => location.pathname.endsWith('/new');
+  const inConv    = () => location.pathname.includes('/conversations/') && !location.pathname.endsWith('/new');
+  const getContactInput = () => document.querySelector('[data-e2e-contact-input]');
+  const getSendToBtn    = () => document.querySelector('[data-e2e-send-to-button]');
+  const getComposer     = () => {
+    const el = document.querySelector('[data-e2e-message-input-box]');
+    return (el && inConv()) ? el : null;
+  };
+  const getSendBtnInConv = () => {
+    const el = document.querySelector('[data-e2e-send-text-button]');
+    return (el && inConv()) ? el : null;
   };
 
-  /* ---------- Reusable predicates ---------- */
-  const isComposerTextarea = (el) =>
-    el.tagName === 'TEXTAREA' &&
-    el.getAttribute('data-e2e-message-input-box') !== null &&
-    el.offsetParent !== null;
-
-  const isSendButton = (el) =>
-    el.tagName === 'BUTTON' &&
-    el.getAttribute('data-e2e-send-text-button') !== null &&
-    el.offsetParent !== null;
+  async function goToNewChat() {
+    if (onNewPage()) return;
+    const btn = document.querySelector('[data-e2e-start-button]');
+    if (!btn) throw new Error('Start button not found');
+    btn.click();
+    await waitFor(onNewPage, { timeout: 8000, interval: 80, label: 'navigate to /new' });
+    await sleep(300);
+  }
 
   const setVal = (el, val) => {
     if (!el) return;
-    const nativeInputValueSetter     = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,  'value')?.set;
-    const nativeTextAreaValueSetter  = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-    if (el.tagName === 'TEXTAREA' && nativeTextAreaValueSetter) {
-      nativeTextAreaValueSetter.call(el, val);
-    } else if (el.tagName === 'INPUT' && nativeInputValueSetter) {
-      nativeInputValueSetter.call(el, val);
-    } else {
-      el.value = val;
-    }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  };
+    const ns = el.tagName === 'TEXTAREA'
+      ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+      : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
 
-  const strongClick = (el) => {
-    if (!el) return;
-    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-    el.focus?.();
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type =>
-      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 }))
-    );
+    if (ns) ns.call(el, val);
+    else el.value = val;
+
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
   function setStatus(txt) {
     const el = document.getElementById(STATUS_ID);
     if (el) el.textContent = txt;
-    const pillStatus = document.getElementById(PILL_STATUS_ID);
-    if (pillStatus) pillStatus.textContent = txt;
+
+    const pill = document.getElementById(PILL_STATUS_ID);
+    if (pill) pill.textContent = txt;
+
     console.log('[BatchSender]', txt);
   }
 
-  /* ---------- Failures UI ---------- */
-  function showFailuresInUI(failedItems) {
+  function showFailuresInUI(items) {
     const box = document.getElementById(FAILURES_ID);
     if (!box) return;
-    if (!failedItems || !failedItems.length) {
+
+    if (!items?.length) {
       box.style.display = 'none';
-      box.textContent   = '';
+      box.textContent = '';
       return;
     }
-    box.style.display = 'block';
-    box.textContent   = '';
 
-    const header = document.createElement('div');
-    Object.assign(header.style, { color: T.danger, fontFamily: "'DM Mono', monospace", marginBottom: '6px', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.06em' });
-    header.textContent = `⚠ ${failedItems.length} FAILED — copy numbers below:`;
-    box.appendChild(header);
+    box.style.display = 'block';
+    box.textContent = '';
+
+    const hdr = document.createElement('div');
+    Object.assign(hdr.style, {
+      color: C.danger,
+      fontFamily: T.fontMono,
+      marginBottom: '6px',
+      fontSize: '10px',
+      textTransform: 'uppercase'
+    });
+    hdr.textContent = `⚠ ${items.length} FAILED — copy numbers below:`;
 
     const list = document.createElement('div');
-    Object.assign(list.style, { fontFamily: "'DM Mono', monospace", fontSize: '10px', color: T.textBody, lineHeight: '1.7', userSelect: 'all' });
-    list.textContent = failedItems.map(f => f.number).join('\n');
-    box.appendChild(list);
+    Object.assign(list.style, {
+      fontFamily: T.fontMono,
+      fontSize: '10px',
+      color: C.textBody,
+      lineHeight: '1.7',
+      userSelect: 'all'
+    });
+    list.textContent = items.map(f => f.number).join('\n');
 
-    console.group('[BatchSender] FINAL FAILURES');
-    console.table(failedItems);
-    console.groupEnd();
+    box.appendChild(hdr);
+    box.appendChild(list);
   }
 
   function toggleRunState(running) {
     isRunning = running;
-    const startBtn = document.getElementById(START_BTN_ID);
-    if (startBtn) {
-      startBtn.disabled      = running;
-      startBtn.style.opacity = running ? '0.5' : '1';
-      startBtn.style.cursor  = running ? 'not-allowed' : 'pointer';
-      startBtn.textContent   = running ? 'Running…' : 'Start Batch';
-    }
-    const nextBtn = document.getElementById(NEXT_BTN_ID);
-    if (nextBtn) {
-      if (!running) {
-        nextBtn.disabled      = true;
-        nextBtn.style.opacity = '0.4';
-        nextBtn.style.cursor  = 'not-allowed';
-      }
-    }
-    updatePillIndicator();
-  }
+    const btn = document.getElementById(START_BTN_ID);
 
-  function setNextButtonEnabled(enabled) {
-    const nextBtn = document.getElementById(NEXT_BTN_ID);
-    if (!nextBtn) return;
-    nextBtn.disabled      = !enabled;
-    nextBtn.style.opacity  = enabled ? '1' : '0.4';
-    nextBtn.style.cursor   = enabled ? 'pointer' : 'not-allowed';
+    if (btn) {
+      btn.disabled = running;
+      btn.style.opacity = running ? '0.5' : '1';
+      btn.style.cursor = running ? 'not-allowed' : 'pointer';
+      btn.textContent = running ? 'Running…' : 'Start Batch';
+    }
+
+    updatePillIndicator();
   }
 
   function updatePillIndicator() {
     const pill = document.getElementById(PILL_ID);
     if (!pill) return;
+
     const dot = pill.querySelector('.__gm_pill_dot');
     if (!dot) return;
-    if (isRunning) {
-      dot.style.background  = T.cyan;
-      dot.style.boxShadow   = `0 0 8px ${T.cyanBorder}`;
-      dot.style.animation   = '__gm_pulse 1.4s infinite';
-    } else if (waitingForNext) {
-      dot.style.background  = T.warning;
-      dot.style.boxShadow   = `0 0 8px ${T.warningBg}`;
-      dot.style.animation   = '__gm_pulse 1.4s infinite';
-    } else {
-      dot.style.background  = T.textMuted;
-      dot.style.boxShadow   = 'none';
-      dot.style.animation   = 'none';
-    }
+
+    dot.style.background = isRunning ? C.cyan : C.textMuted;
+    dot.style.animation = isRunning ? '__gm_pulse 1.2s infinite' : 'none';
   }
 
-  function composerIsVisible() {
-    return !!cachedDeepFind('composer', isComposerTextarea);
-  }
-
-  function hasAttachment() {
-    return !!document.querySelector('mw-attachment-view, [data-e2e-attached-media]');
-  }
-
-  function findNumberInput() {
-    let inp = deepFind(el =>
-      (el.tagName === 'INPUT' || el.getAttribute('role') === 'combobox') &&
-      (el.offsetParent !== null) &&
-      (/name|phone|email|number|recipient|to/i.test(el.getAttribute('aria-label') || '') ||
-       /name|phone|email|number|recipient|to/i.test(el.getAttribute('placeholder') || ''))
-    );
-    if (inp) return inp;
-
-    inp = deepFind(el =>
-      el.tagName === 'INPUT' &&
-      el.type === 'text' &&
-      el.offsetParent !== null &&
-      !el.readOnly &&
-      !el.disabled
-    );
-    if (inp) return inp;
-
-    inp = deepFind(el =>
-      el.getAttribute('role') === 'combobox' &&
-      el.offsetParent !== null
-    );
-    if (inp) return inp;
-
-    inp = deepFind(el =>
-      (el.tagName === 'INPUT' || el.contentEditable === 'true') &&
-      el.offsetParent !== null &&
-      !el.readOnly &&
-      el.closest('mw-conversation-container, [role="dialog"], .modal, .overlay, [data-e2e-new-conversation]')
-    );
-
-    return inp;
-  }
-
-  function findStartChatButton() {
-    let btn = cachedDeepFind('startChat', (el) =>
-      (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tabIndex >= 0) &&
-      /start chat|new chat|new conversation|compose/i.test((el.textContent || '') + (el.getAttribute('aria-label') || ''))
-    );
-    if (btn) return btn;
-
-    btn = deepFind(el =>
-      (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') &&
-      (el.classList.contains('fab') ||
-       /add|plus|create|new/i.test(el.getAttribute('aria-label') || '') ||
-       el.querySelector('mat-icon, [data-mat-icon-name]'))
-    );
-    if (btn) return btn;
-
-    btn = deepFind(el =>
-      el.getAttribute('data-e2e-start-chat-button') !== null ||
-      el.getAttribute('data-e2e-new-conversation') !== null
-    );
-
-    return btn;
-  }
-
-  function setMinimized(minimize) {
-    isMinimized = minimize;
+  function setMinimized(v) {
+    isMinimized = v;
     const panel = document.getElementById(PANEL_ID);
-    const pill  = document.getElementById(PILL_ID);
+    const pill = document.getElementById(PILL_ID);
+
     if (!panel || !pill) return;
-    if (minimize) {
-      panel.style.display = 'none';
-      pill.style.display  = 'flex';
-      updatePillIndicator();
-    } else {
-      panel.style.display = 'block';
-      pill.style.display  = 'none';
-    }
+
+    panel.style.display = v ? 'none' : 'block';
+    pill.style.display = v ? 'flex' : 'none';
+
+    if (v) updatePillIndicator();
   }
 
-  /* ---------- UI Panel ---------- */
-  function addPanel() {
-    if (document.getElementById(PANEL_ID)) return;
+  let _cachedText = null;
+  let _cachedImageBlobs = null;
 
-    if (!document.getElementById('gm-batch-fonts')) {
-      const fl = Object.assign(document.createElement('link'), { id:'gm-batch-fonts', rel:'stylesheet',
-        href:'https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:ital,wght@0,400;0,500&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700&display=swap' });
-      document.head.appendChild(fl);
-    }
+  function extractMessageContent() {
+    const box = document.getElementById(MSG_ID);
+    if (!box) return false;
 
-    const style = document.createElement('style');
-    style.textContent = `
-      @keyframes __gm_pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-      #${MSG_ID} img { max-height: 150px; max-width: 100%; height: auto; width: auto; display: block; margin: 4px 0; border-radius: 4px; border: 1px solid ${T.border}; }
-      #${START_BTN_ID}:hover:not(:disabled) { background: ${T.cyan} !important; color: ${T.pageBg} !important; transform: translateY(-1px); box-shadow: 0 4px 15px ${T.cyanBorder}; }
-      #${STOP_BTN_ID}:hover  { background: ${T.dangerBg} !important; border-color: ${T.danger} !important; color: ${T.danger} !important; transform: translateY(-1px); }
-      #${NEXT_BTN_ID}:hover:not(:disabled) { background: ${T.cyanHover} !important; border-color: ${T.cyan} !important; color: ${T.cyan} !important; transform: translateY(-1px); box-shadow: 0 4px 15px ${T.cyanBorder}; }
-      #${START_BTN_ID}, #${STOP_BTN_ID}, #${NEXT_BTN_ID} { transition: all 0.2s ease; }
-      #${MIN_BTN_ID} { background: transparent; border: 1px solid ${T.border}; color: ${T.textMuted}; width: 24px; height: 24px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; transition: all 0.15s ease; font-size: 14px; line-height: 1; }
-      #${MIN_BTN_ID}:hover { border-color: ${T.cyanBorder}; color: ${T.cyan}; background: ${T.cyanHover}; }
-
-      #${PILL_ID} { position: fixed; top: 16px; right: 16px; z-index: 2147483647; display: none; align-items: center; gap: 8px; padding: 8px 12px; background: ${T.panelBg}; border: 1px solid ${T.border}; border-radius: 6px; cursor: pointer; box-shadow: 0 8px 24px rgba(8,10,13,0.9), 0 0 0 1px rgba(0,212,255,0.05); font-family: 'DM Sans', sans-serif; font-size: 11px; color: ${T.textBody}; transition: all 0.2s ease; max-width: 260px; }
-      #${PILL_ID}:hover { border-color: ${T.cyanBorder}; background: ${T.cardBg}; transform: translateY(-1px); box-shadow: 0 12px 32px rgba(8,10,13,0.95), 0 0 0 1px ${T.cyanBorder}; }
-      #${PILL_ID} .__gm_pill_dot   { width: 8px; height: 8px; border-radius: 50%; background: ${T.textMuted}; flex-shrink: 0; transition: all 0.2s ease; }
-      #${PILL_ID} .__gm_pill_label { color: ${T.cyan}; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; font-size: 10px; font-family: 'DM Mono', monospace; flex-shrink: 0; }
-      #${PILL_ID} #${PILL_STATUS_ID} { color: ${T.textMuted}; font-family: 'DM Mono', monospace; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
-
-      .__gm_tab { flex: 1; padding: 9px 0; background: transparent; color: ${T.textMuted}; border: none; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; transition: all 0.2s ease; font-family: 'DM Mono', monospace; }
-      .__gm_tab:hover { color: ${T.textBody}; }
-      .__gm_tab.__gm_tab_active { color: ${T.cyan}; border-bottom-color: ${T.cyan}; }
-
-      #${PREVIEW_ID} { margin-top: 8px; max-height: 80px; overflow-y: auto; font-size: 10px; font-family: 'DM Mono', monospace; color: ${T.textMuted}; padding: 8px 10px; background: ${T.pageBg}; border-radius: 4px; border: 1px solid ${T.border}; line-height: 1.5; }
-      #${PREVIEW_ID} .pair-row   { display: flex; gap: 6px; padding: 2px 0; }
-      #${PREVIEW_ID} .pair-num   { color: ${T.textBody}; flex-shrink: 0; min-width: 75px; }
-      #${PREVIEW_ID} .pair-arrow { color: ${T.cyan}; flex-shrink: 0; }
-      #${PREVIEW_ID} .pair-msg   { color: ${T.textMuted}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-      #${FAILURES_ID} { display: none; margin-top: 10px; padding: 10px; background: ${T.dangerBg}; border: 1px solid rgba(255,77,106,0.3); border-radius: 4px; max-height: 120px; overflow-y: auto; }
-
-      #${PANEL_ID} ::-webkit-scrollbar        { width: 4px; }
-      #${PANEL_ID} ::-webkit-scrollbar-track  { background: transparent; }
-      #${PANEL_ID} ::-webkit-scrollbar-thumb  { background: ${T.border}; border-radius: 4px; }
-      #${PANEL_ID} ::-webkit-scrollbar-thumb:hover { background: ${T.textMuted}; }
-
-      .__gm_header::after {
-        content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 2px;
-        background: linear-gradient(90deg, transparent, ${T.cyan}, transparent);
+    let text = '';
+    const walker = document.createTreeWalker(
+      box,
+      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+      {
+        acceptNode: n =>
+          n.nodeType === Node.ELEMENT_NODE && n.tagName === 'IMG'
+            ? NodeFilter.FILTER_REJECT
+            : NodeFilter.FILTER_ACCEPT
       }
-    `;
-    document.head.appendChild(style);
+    );
 
-    const panel = document.createElement('div');
-    panel.id = PANEL_ID;
-    Object.assign(panel.style, {
-      position:     'fixed',
-      top:          '16px',
-      right:        '16px',
-      width:        '260px',
-      padding:      '12px',
-      background:   T.panelBg,
-      backgroundImage: `linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px)`,
-      backgroundSize: '40px 40px',
-      color:        T.textPrimary,
-      border:       `1px solid ${T.border}`,
-      borderRadius: '6px',
-      boxShadow:    '0 20px 50px rgba(8,10,13,0.9), 0 0 0 1px rgba(0,212,255,0.05)',
-      zIndex:       '2147483647',
-      fontFamily:   "'DM Sans', sans-serif",
-      fontSize:     '12px',
-      lineHeight:   '1.4',
-    });
+    let node;
+    let lastBR = false;
 
-    /* ---- Header ---- */
-    const header = document.createElement('div');
-    header.className = '__gm_header';
-    Object.assign(header.style, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: '12px', marginBottom: '12px', position: 'relative' });
+    while ((node = walker.nextNode())) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.textContent) {
+          text += node.textContent;
+          lastBR = false;
+        }
+      } else if (node.tagName === 'BR') {
+        if (!lastBR) {
+          text += '\n';
+          lastBR = true;
+        }
+      } else if (node.tagName === 'DIV' || node.tagName === 'P') {
+        if (text && !text.endsWith('\n')) text += '\n';
+        lastBR = false;
+      }
+    }
 
-    const title = document.createElement('div');
-    title.textContent = 'Batch Sender';
-    Object.assign(title.style, { fontFamily: "'Bebas Neue', sans-serif", fontSize: '18px', color: T.cyan, letterSpacing: '1px', margin: '0' });
+    _cachedText = text.trim();
+    _cachedImageBlobs = null;
 
-    const minBtn = document.createElement('button');
-    minBtn.id   = MIN_BTN_ID;
-    minBtn.type = 'button';
-    minBtn.title = 'Minimize';
-    minBtn.setAttribute('aria-label', 'Minimize panel');
-    minBtn.textContent = '–';
-
-    header.appendChild(title);
-    header.appendChild(minBtn);
-
-    /* ---- Body wrapper ---- */
-    const body = document.createElement('div');
-    body.id = BODY_ID;
-
-    /* ---- Tabs ---- */
-    const tabRow = document.createElement('div');
-    Object.assign(tabRow.style, { display: 'flex', gap: '0', marginBottom: '14px', borderBottom: `1px solid ${T.border}` });
-
-    const tabBatch = document.createElement('button');
-    tabBatch.id        = TAB_BATCH_ID;
-    tabBatch.className = '__gm_tab __gm_tab_active';
-    tabBatch.textContent = 'Same Message';
-    tabBatch.type = 'button';
-
-    const tabPaired = document.createElement('button');
-    tabPaired.id        = TAB_PAIRED_ID;
-    tabPaired.className = '__gm_tab';
-    tabPaired.textContent = 'Paired';
-    tabPaired.type = 'button';
-
-    tabRow.appendChild(tabBatch);
-    tabRow.appendChild(tabPaired);
-
-    /* ---- Input styles helper ---- */
-    const inputStyles = {
-      width: '100%', background: T.cardBg, color: T.textPrimary,
-      border: `1px solid ${T.border}`, borderRadius: '4px',
-      padding: '8px', boxSizing: 'border-box', fontSize: '10px',
-      fontFamily: "'DM Mono', monospace",
-      transition: 'all 0.2s ease', outline: 'none',
-    };
-    const focusHandler = function () { this.style.border = `1px solid ${T.cyan}`; this.style.boxShadow = `0 0 0 3px ${T.cyanBorder}`; };
-    const blurHandler  = function () { this.style.border = `1px solid ${T.border}`;      this.style.boxShadow = 'none'; };
-
-    const labelStyles = { marginBottom: '6px', fontSize: '10px', fontFamily: "'DM Mono', monospace", color: T.cyan, textTransform: 'uppercase', letterSpacing: '0.06em', opacity: '0.85' };
-
-    /* ---- Batch view ---- */
-    const viewBatch = document.createElement('div');
-    viewBatch.id = VIEW_BATCH_ID;
-
-    const numsLabel = document.createElement('div');
-    numsLabel.textContent = 'Phone Numbers';
-    Object.assign(numsLabel.style, labelStyles);
-
-    const numsBox = document.createElement('textarea');
-    numsBox.id = NUMS_ID;
-    Object.assign(numsBox.style, { ...inputStyles, height: '55px', resize: 'vertical' });
-    numsBox.placeholder = '5597409248\n5597409249\n...';
-    numsBox.addEventListener('focus', focusHandler);
-    numsBox.addEventListener('blur',  blurHandler);
-
-    const msgLabel = document.createElement('div');
-    msgLabel.textContent = 'Message Content';
-    Object.assign(msgLabel.style, { ...labelStyles, margin: '12px 0 6px 0' });
-
-    const msgBox = document.createElement('div');
-    msgBox.id = MSG_ID;
-    msgBox.contentEditable = 'true';
-    Object.assign(msgBox.style, {
-      ...inputStyles,
-      minHeight: '45px', maxHeight: '80px', overflowY: 'auto',
-      whiteSpace: 'pre-wrap', wordWrap: 'break-word',
-    });
-    msgBox.addEventListener('focus', focusHandler);
-    msgBox.addEventListener('blur',  blurHandler);
-
-    viewBatch.appendChild(numsLabel);
-    viewBatch.appendChild(numsBox);
-    viewBatch.appendChild(msgLabel);
-    viewBatch.appendChild(msgBox);
-
-    /* ---- Paired view ---- */
-    const viewPaired = document.createElement('div');
-    viewPaired.id = VIEW_PAIRED_ID;
-    viewPaired.style.display = 'none';
-
-    const pairedLabel = document.createElement('div');
-    pairedLabel.textContent = 'Paste from Sheets or Type Pairs';
-    Object.assign(pairedLabel.style, labelStyles);
-
-    const pairedHint = document.createElement('div');
-    Object.assign(pairedHint.style, { marginBottom: '8px', fontSize: '10px', color: T.textMuted, lineHeight: '1.5' });
-
-    const pairedBox = document.createElement('textarea');
-    pairedBox.id = PAIRED_ID;
-    Object.assign(pairedBox.style, { ...inputStyles, height: '100px', resize: 'vertical', lineHeight: '1.6' });
-    pairedBox.addEventListener('focus', focusHandler);
-    pairedBox.addEventListener('blur',  blurHandler);
-
-    const preview = document.createElement('div');
-    preview.id = PREVIEW_ID;
-    preview.textContent = 'Parsed pairs will appear here…';
-
-    pairedBox.addEventListener('input', () => updatePreview());
-    pairedBox.addEventListener('paste', () => setTimeout(updatePreview, 50));
-
-    viewPaired.appendChild(pairedLabel);
-    viewPaired.appendChild(pairedHint);
-    viewPaired.appendChild(pairedBox);
-    viewPaired.appendChild(preview);
-
-    /* ---- Buttons ---- */
-    const btnRow = document.createElement('div');
-    Object.assign(btnRow.style, { display: 'flex', gap: '8px', marginTop: '14px' });
-
-    const startBtn = document.createElement('button');
-    startBtn.id          = START_BTN_ID;
-    startBtn.type        = 'button';
-    startBtn.textContent = 'Start Batch';
-    Object.assign(startBtn.style, {
-      flex: '1', padding: '8px 10px', background: T.cyanDim, color: '#fff',
-      border: `1px solid ${T.cyan}`, borderRadius: '4px', cursor: 'pointer',
-      fontFamily: "'DM Sans', sans-serif", fontWeight: '600', fontSize: '12px',
-      boxShadow: '0 2px 12px rgba(0,212,255,0.1)',
-    });
-
-    const stopBtn = document.createElement('button');
-    stopBtn.id          = STOP_BTN_ID;
-    stopBtn.type        = 'button';
-    stopBtn.textContent = 'Stop';
-    Object.assign(stopBtn.style, {
-      width: '70px', padding: '10px', background: T.pageBg,
-      color: T.textMuted, border: `1px solid ${T.border}`,
-      borderRadius: '4px', cursor: 'pointer', fontFamily: "'DM Sans', sans-serif", fontWeight: '600', fontSize: '12px',
-    });
-
-    const nextBtn = document.createElement('button');
-    nextBtn.id          = NEXT_BTN_ID;
-    nextBtn.type        = 'button';
-    nextBtn.textContent = 'Continue';
-    nextBtn.disabled    = true;
-    Object.assign(nextBtn.style, {
-      marginTop: '8px', width: '100%', padding: '10px',
-      background: T.cyanHover, color: T.cyan, border: `1px solid ${T.cyanBorder}`,
-      borderRadius: '4px', cursor: 'not-allowed', fontFamily: "'DM Sans', sans-serif", fontWeight: '600',
-      fontSize: '12px', letterSpacing: '0.02em', opacity: '0.4',
-    });
-
-    const status = document.createElement('div');
-    status.id = STATUS_ID;
-    status.textContent = 'Ready';
-    Object.assign(status.style, {
-      marginTop: '12px', color: T.textMuted, minHeight: '18px', fontSize: '11px',
-      padding: '8px 10px', background: T.pageBg, borderRadius: '4px',
-      border: `1px solid ${T.border}`, fontFamily: "'DM Mono', monospace",
-    });
-
-    const failuresBox = document.createElement('div');
-    failuresBox.id = FAILURES_ID;
-
-    btnRow.appendChild(startBtn);
-    btnRow.appendChild(stopBtn);
-
-    body.appendChild(tabRow);
-    body.appendChild(viewBatch);
-    body.appendChild(viewPaired);
-    body.appendChild(btnRow);
-    body.appendChild(nextBtn);
-    body.appendChild(status);
-    body.appendChild(failuresBox);
-
-    panel.appendChild(header);
-    panel.appendChild(body);
-    document.body.appendChild(panel);
-
-    /* ---- Minimized pill ---- */
-    const pill = document.createElement('div');
-    pill.id = PILL_ID;
-    pill.title = 'Click to expand Batch Sender';
-    pill.setAttribute('role', 'button');
-    pill.setAttribute('tabindex', '0');
-
-    const pillDot = document.createElement('div');
-    pillDot.className = '__gm_pill_dot';
-
-    const pillLabel = document.createElement('span');
-    pillLabel.className = '__gm_pill_label';
-    pillLabel.textContent = 'Batch';
-
-    const pillStatus = document.createElement('span');
-    pillStatus.id = PILL_STATUS_ID;
-    pillStatus.textContent = 'Ready';
-
-    pill.appendChild(pillDot);
-    pill.appendChild(pillLabel);
-    pill.appendChild(pillStatus);
-    document.body.appendChild(pill);
+    return box.querySelectorAll('img').length > 0;
   }
 
-  /* ---------- Tab switching ---------- */
-  function switchTab(mode) {
-    activeMode = mode;
-    const tabBatch   = document.getElementById(TAB_BATCH_ID);
-    const tabPaired  = document.getElementById(TAB_PAIRED_ID);
-    const viewBatch  = document.getElementById(VIEW_BATCH_ID);
-    const viewPaired = document.getElementById(VIEW_PAIRED_ID);
+  async function ensureImageBlobs() {
+    if (_cachedImageBlobs !== null) return _cachedImageBlobs;
 
-    if (mode === 'batch') {
-      tabBatch.classList.add('__gm_tab_active');
-      tabPaired.classList.remove('__gm_tab_active');
-      viewBatch.style.display  = 'block';
-      viewPaired.style.display = 'none';
-    } else {
-      tabPaired.classList.add('__gm_tab_active');
-      tabBatch.classList.remove('__gm_tab_active');
-      viewBatch.style.display  = 'none';
-      viewPaired.style.display = 'block';
+    const imgs = document.getElementById(MSG_ID)?.querySelectorAll('img') || [];
+    const blobs = await Promise.all([...imgs].map(async img => {
+      try {
+        return await (await fetch(img.src)).blob();
+      } catch {
+        return null;
+      }
+    }));
+
+    _cachedImageBlobs = blobs.filter(Boolean);
+    return _cachedImageBlobs;
+  }
+
+  async function transferContent(composer, textOverride = null) {
+    composer.focus();
+
+    const text = textOverride !== null ? textOverride : _cachedText;
+
+    if (text) {
+      setVal(composer, text);
+      await sleep(150);
+    }
+
+    if (textOverride === null) {
+      const blobs = await ensureImageBlobs();
+
+      if (blobs?.length) {
+        const dt = new DataTransfer();
+        for (const blob of blobs) {
+          dt.items.add(new File([blob], 'image.png', { type: blob.type }));
+        }
+
+        composer.dispatchEvent(new ClipboardEvent('paste', {
+          clipboardData: dt,
+          bubbles: true,
+          cancelable: true
+        }));
+
+        await sleep(500);
+      }
     }
   }
 
-  /* ---------- Parsers ---------- */
+  async function prepAndWaitSend(number, index, total, textOverride = null) {
+    const tag = `[${index + 1}/${total}]`;
+
+    setStatus(`${tag} Opening new chat…`);
+    await goToNewChat();
+
+    setStatus(`${tag} Waiting for contact input…`);
+    await waitFor(() => {
+      const el = getContactInput();
+      return (el && el.value === '') ? el : null;
+    }, { timeout: 6000, interval: 80, label: 'contact input' });
+
+    await sleep(100);
+
+    setStatus(`${tag} Entering number…`);
+    const input = getContactInput();
+
+    const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (nativeInputSetter) nativeInputSetter.call(input, number);
+    else input.value = number;
+
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(300);
+
+    setStatus(`${tag} Waiting for Send To button…`);
+    await waitFor(() => getSendToBtn() || inConv(), {
+      timeout: 8000,
+      interval: 80,
+      label: 'send-to or auto-nav'
+    });
+
+    if (!inConv()) {
+      getSendToBtn().click();
+
+      setStatus(`${tag} Waiting for conversation…`);
+      await waitFor(inConv, {
+        timeout: 8000,
+        interval: 80,
+        label: 'conversation URL'
+      });
+    }
+
+    await sleep(500);
+
+    setStatus(`${tag} Waiting for composer…`);
+    const composer = await waitFor(getComposer, {
+      timeout: 6000,
+      interval: 80,
+      label: 'composer'
+    });
+
+    await sleep(200);
+
+    setStatus(`${tag} Injecting message…`);
+    await transferContent(composer, textOverride);
+
+    setStatus(`${tag} Finding send button…`);
+    const sendBtn = await waitFor(getSendBtnInConv, {
+      timeout: 10000,
+      interval: 100,
+      label: 'send button'
+    });
+
+    sendBtn.style.outline = `3px solid ${C.cyan}`;
+    sendBtn.style.outlineOffset = '2px';
+    sendBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    setStatus(`${tag} ✋ Click Send when ready…`);
+
+    const sendDeadline = Date.now() + 300000;
+    let messageSent = false;
+
+    await sleep(150);
+
+    while (Date.now() < sendDeadline) {
+      if (stopRequested) throw new Error('Stopped');
+
+      const currentBtn = document.querySelector('[data-e2e-send-text-button]');
+      if (!currentBtn || currentBtn.disabled) {
+        messageSent = true;
+        break;
+      }
+
+      await sleep(80);
+    }
+
+    sendBtn.style.outline = '';
+    sendBtn.style.outlineOffset = '';
+
+    if (!messageSent) throw new Error('Send timed out');
+
+    setStatus(`${tag} ✓ Sent`);
+    await sleep(300);
+  }
+
+  async function attemptWithRetries({ number, message, index, total, modeLabel }) {
+    let lastErr;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (stopRequested) throw new Error('Stopped');
+
+      try {
+        setStatus(`[${index + 1}/${total}] ${modeLabel} attempt ${attempt}/2…`);
+        await prepAndWaitSend(number, index, total, message);
+        return { ok: true };
+      } catch (e) {
+        lastErr = e;
+
+        if (e.message === 'Stopped') throw e;
+
+        console.error('[BatchSender] attempt failed', attempt, number, e.message);
+        await sleep(600);
+      }
+    }
+
+    return { ok: false, error: lastErr?.message || 'Unknown' };
+  }
+
+  async function retryFailures(failed, label) {
+    if (!failed.length || stopRequested) return failed;
+
+    setStatus(`${label}: Retry pass…`);
+
+    const next = [];
+
+    for (let i = 0; i < failed.length; i++) {
+      if (stopRequested) break;
+
+      const item = failed[i];
+      const msg = item.message ?? item.capturedText ?? '';
+
+      if (wasSent(item.number, msg)) continue;
+
+      const r = await attemptWithRetries({
+        number: item.number,
+        message: item.message ?? null,
+        index: i,
+        total: failed.length,
+        modeLabel: 'Retry'
+      });
+
+      if (r.ok) markSent(item.number, msg);
+      else next.push({ ...item, error: r.error });
+    }
+
+    return next;
+  }
+
+  async function runBatch(numbers) {
+    stopRequested = false;
+    toggleRunState(true);
+    showFailuresInUI([]);
+
+    const hasImages = extractMessageContent();
+
+    if (hasImages) {
+      setStatus('Pre-loading images…');
+      await ensureImageBlobs();
+    }
+
+    const textSnapshot = _cachedText || '';
+
+    let ok = 0;
+    let fail = 0;
+    let skip = 0;
+
+    const failed = [];
+
+    for (let i = 0; i < numbers.length; i++) {
+      if (stopRequested) {
+        setStatus('Stopped.');
+        break;
+      }
+
+      const num = numbers[i];
+
+      if (wasSent(num, textSnapshot)) {
+        skip++;
+        setStatus(`[${i + 1}/${numbers.length}] Skipping duplicate ${num}.`);
+        continue;
+      }
+
+      const r = await attemptWithRetries({
+        number: num,
+        message: null,
+        index: i,
+        total: numbers.length,
+        modeLabel: 'Batch'
+      });
+
+      if (r.ok) {
+        markSent(num, textSnapshot);
+        ok++;
+      } else {
+        fail++;
+        failed.push({
+          number: num,
+          message: null,
+          capturedText: textSnapshot,
+          error: r.error
+        });
+      }
+    }
+
+    if (!stopRequested && failed.length) {
+      const remaining = await retryFailures(failed, 'Batch');
+      ok += failed.length - remaining.length;
+      fail = remaining.length;
+
+      if (remaining.length) showFailuresInUI(remaining);
+    }
+
+    const parts = [`${ok} sent`, `${fail} failed`];
+    if (skip) parts.push(`${skip} skipped duplicate`);
+
+    setStatus(`Done. ${parts.join(', ')}.`);
+    toggleRunState(false);
+  }
+
+  async function runPaired(pairs) {
+    stopRequested = false;
+    toggleRunState(true);
+    showFailuresInUI([]);
+
+    _cachedText = null;
+    _cachedImageBlobs = [];
+
+    let ok = 0;
+    let fail = 0;
+    let skip = 0;
+
+    const failed = [];
+
+    for (let i = 0; i < pairs.length; i++) {
+      if (stopRequested) {
+        setStatus('Stopped.');
+        break;
+      }
+
+      const { number, message } = pairs[i];
+      const nameMatch = message.match(/^Hey\s+(\w+)/i);
+      const nameTag = nameMatch ? nameMatch[1] : number;
+
+      if (wasSent(number, message)) {
+        skip++;
+        setStatus(`[${i + 1}/${pairs.length}] Skipping duplicate ${nameTag}.`);
+        continue;
+      }
+
+      const r = await attemptWithRetries({
+        number,
+        message,
+        index: i,
+        total: pairs.length,
+        modeLabel: 'Paired'
+      });
+
+      if (r.ok) {
+        markSent(number, message);
+        ok++;
+        setStatus(`[${i + 1}/${pairs.length}] ✓ ${nameTag}`);
+      } else {
+        fail++;
+        failed.push({
+          number,
+          message,
+          capturedText: message,
+          name: nameTag,
+          error: r.error
+        });
+      }
+    }
+
+    if (!stopRequested && failed.length) {
+      const remaining = await retryFailures(failed, 'Paired');
+      ok += failed.length - remaining.length;
+      fail = remaining.length;
+
+      if (remaining.length) showFailuresInUI(remaining);
+    }
+
+    const parts = [`${ok} sent`, `${fail} failed`];
+    if (skip) parts.push(`${skip} skipped duplicate`);
+
+    setStatus(`Done. ${parts.join(', ')}.`);
+    toggleRunState(false);
+  }
+
   function parseNumbers(raw) {
     const seen = new Set();
-    return raw
-      .split(/[\n,]+/)
+
+    return raw.split(/[\n,]+/)
       .map(s => digits(s.trim()))
       .filter(s => s.length >= 7)
       .filter(s => {
@@ -633,43 +654,53 @@
 
   function parsePairs(raw) {
     raw = (raw || '').replace(/\r/g, '');
+
     const pairs = [];
-    const lines  = raw.split('\n');
+    const lines = raw.split('\n');
     let i = 0;
 
-    const startsWithNumber = (line) => /^\s*"?\s*[\+\(\)\-\d][\d\s\-\+\(\)]{6,}/.test(line || '');
+    const startsWithNumber = l =>
+      /^\s*"?\s*[\+\(\)\-\d][\d\s\-\+\(\)]{6,}/.test(l || '');
 
     while (i < lines.length) {
-      let line = lines[i];
-      if (!line || !line.replace(/["\s]/g, '')) { i++; continue; }
-      if (!startsWithNumber(line)) {
-        throw new Error(`Paired parse error at line ${i + 1}: line does not start with a phone number.`);
+      const line = lines[i];
+
+      if (!line?.replace(/["\s]/g, '')) {
+        i++;
+        continue;
       }
 
-      const tabIdx  = line.indexOf('\t');
+      if (!startsWithNumber(line)) {
+        throw new Error(`Line ${i + 1} doesn't start with a phone number.`);
+      }
+
+      const tabIdx = line.indexOf('\t');
       const pipeIdx = line.indexOf('|');
+
       let num = '';
       let msg = '';
 
       if (tabIdx !== -1) {
-        const left = line.slice(0, tabIdx).trim();
-        let right   = line.slice(tabIdx + 1);
-        num = digits(left);
+        num = digits(line.slice(0, tabIdx).trim());
 
-        const trimmedRight = right.trimStart();
-        const startsQuoted = trimmedRight.startsWith('"');
+        let right = line.slice(tabIdx + 1);
+        const trimmed = right.trimStart();
 
-        if (startsQuoted) {
-          let field = trimmedRight;
-          const isClosed = (s) => {
-            let inQuotes = false;
+        if (trimmed.startsWith('"')) {
+          let field = trimmed;
+
+          const isClosed = s => {
+            let q = false;
+
             for (let k = 0; k < s.length; k++) {
               if (s[k] === '"') {
-                const next = s[k + 1];
-                if (inQuotes && next === '"') { k++; } else { inQuotes = !inQuotes; }
+                const n = s[k + 1];
+                if (q && n === '"') k++;
+                else q = !q;
               }
             }
-            return !inQuotes;
+
+            return !q;
           };
 
           while (!isClosed(field)) {
@@ -678,605 +709,496 @@
             field += '\n' + lines[i];
           }
 
-          if (!isClosed(field)) {
-            throw new Error(`Paired parse error: unterminated quoted message starting near line ${i + 1}.`);
-          }
-          field = field.trim();
-          if (!(field.startsWith('"') && field.endsWith('"'))) {
-            throw new Error(`Paired parse error near line ${i + 1}: quoted message not properly closed.`);
-          }
-          msg = field.slice(1, -1).replace(/""/g, '"');
+          msg = field.trim().slice(1, -1).replace(/""/g, '"');
         } else {
           msg = right.trim();
         }
       } else if (pipeIdx !== -1) {
         num = digits(line.slice(0, pipeIdx).trim());
         msg = line.slice(pipeIdx + 1).trim();
-        if (msg.startsWith('"') && msg.endsWith('"')) msg = msg.slice(1, -1).replace(/""/g, '"');
+
+        if (msg.startsWith('"') && msg.endsWith('"')) {
+          msg = msg.slice(1, -1).replace(/""/g, '"');
+        }
       } else {
-        throw new Error(`Paired parse error at line ${i + 1}: missing tab separator. Copy columns J+K together from Sheets.`);
+        throw new Error(`Line ${i + 1}: missing tab separator.`);
       }
 
-      if (num.length < 7) throw new Error(`Paired parse error near line ${i + 1}: invalid number.`);
-      if (!msg)           throw new Error(`Paired parse error near line ${i + 1}: empty message for ${num}.`);
+      if (num.length < 7) throw new Error(`Line ${i + 1}: invalid number.`);
+      if (!msg) throw new Error(`Line ${i + 1}: empty message.`);
 
       pairs.push({ number: num, message: msg });
       i++;
     }
 
     const seen = new Set();
+
     for (const p of pairs) {
-      if (seen.has(p.number)) throw new Error(`Paired parse error: duplicate number detected: ${p.number}`);
+      if (seen.has(p.number)) throw new Error(`Duplicate: ${p.number}`);
       seen.add(p.number);
     }
 
     return pairs;
   }
 
-  /* ---------- Live preview ---------- */
+  function addPanel() {
+    if (document.getElementById(PANEL_ID)) return;
+
+    if (window.DSP_UI) DSP_UI.injectTheme();
+
+    const style = document.createElement('style');
+    style.textContent = `
+      @keyframes __gm_pulse{0%,100%{opacity:1}50%{opacity:.4}}
+      #${MSG_ID} img{max-height:150px;max-width:100%;display:block;margin:4px 0;border-radius:4px;border:1px solid ${C.border};}
+      #${START_BTN_ID}:hover:not(:disabled){background:${C.cyan}!important;color:${C.pageBg}!important;transform:translateY(-1px);}
+      #${STOP_BTN_ID}:hover{background:${C.dangerBg}!important;border-color:${C.danger}!important;color:${C.danger}!important;}
+      #${START_BTN_ID},#${STOP_BTN_ID}{transition:all .2s ease;}
+      #${MIN_BTN_ID}{background:transparent;border:1px solid ${C.border};color:${C.textMuted};width:24px;height:24px;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;font-size:14px;line-height:1;transition:all .15s ease;}
+      #${MIN_BTN_ID}:hover{border-color:${C.cyanBorder};color:${C.cyan};background:${C.cyanHover};}
+      #${PILL_ID}{position:fixed;top:16px;right:16px;z-index:2147483647;display:none;align-items:center;gap:8px;padding:8px 12px;background:${C.panelBg};border:1px solid ${C.border};border-radius:6px;cursor:pointer;font-family:${T.fontBody};font-size:11px;color:${C.textBody};box-shadow:0 8px 24px rgba(8,10,13,.9);transition:all .2s;}
+      #${PILL_ID}:hover{border-color:${C.cyanBorder};transform:translateY(-1px);}
+      #${PILL_ID} .__gm_pill_dot{width:8px;height:8px;border-radius:50%;background:${C.textMuted};flex-shrink:0;transition:all .2s;}
+      #${PILL_ID} .__gm_pill_label{color:${C.cyan};font-weight:700;letter-spacing:.04em;text-transform:uppercase;font-size:10px;font-family:${T.fontMono};flex-shrink:0;}
+      #${PILL_STATUS_ID}{color:${C.textMuted};font-family:${T.fontMono};font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px;}
+      .__gm_tab{flex:1;padding:9px 0;background:transparent;color:${C.textMuted};border:none;border-bottom:2px solid transparent;cursor:pointer;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.08em;transition:all .2s;font-family:${T.fontMono};}
+      .__gm_tab:hover{color:${C.textBody};}
+      .__gm_tab.__gm_tab_active{color:${C.cyan};border-bottom-color:${C.cyan};}
+      #${PREVIEW_ID}{margin-top:8px;max-height:80px;overflow-y:auto;font-size:10px;font-family:${T.fontMono};color:${C.textMuted};padding:8px 10px;background:${C.pageBg};border-radius:4px;border:1px solid ${C.border};line-height:1.5;}
+      #${PREVIEW_ID} .pair-row{display:flex;gap:6px;padding:2px 0;}
+      #${PREVIEW_ID} .pair-num{color:${C.textBody};flex-shrink:0;min-width:75px;}
+      #${PREVIEW_ID} .pair-arrow{color:${C.cyan};flex-shrink:0;}
+      #${PREVIEW_ID} .pair-msg{color:${C.textMuted};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+      #${FAILURES_ID}{display:none;margin-top:10px;padding:10px;background:${C.dangerBg};border:1px solid rgba(255,77,106,.3);border-radius:4px;max-height:120px;overflow-y:auto;}
+      #${PANEL_ID} ::-webkit-scrollbar{width:4px;}
+      #${PANEL_ID} ::-webkit-scrollbar-thumb{background:${C.border};border-radius:4px;}
+      .__gm_input:focus{border-color:${C.cyan}!important;box-shadow:0 0 0 3px ${C.cyanBorder}!important;outline:none;}
+      .__gm_header::after{content:'';position:absolute;bottom:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,transparent,${C.cyan},transparent);}
+    `;
+    document.head.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    Object.assign(panel.style, {
+      position: 'fixed',
+      top: '16px',
+      right: '16px',
+      width: '260px',
+      padding: '12px',
+      background: C.panelBg,
+      color: C.textPrimary,
+      border: `1px solid ${C.border}`,
+      borderRadius: '6px',
+      boxShadow: '0 20px 50px rgba(8,10,13,.9)',
+      zIndex: '2147483647',
+      fontFamily: T.fontBody,
+      fontSize: '12px',
+      lineHeight: '1.4'
+    });
+
+    const header = document.createElement('div');
+    header.className = '__gm_header';
+    Object.assign(header.style, {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingBottom: '12px',
+      marginBottom: '12px',
+      position: 'relative'
+    });
+
+    const title = document.createElement('div');
+    title.textContent = 'Batch Sender';
+    Object.assign(title.style, {
+      fontFamily: T.fontDisplay,
+      fontSize: '18px',
+      color: C.cyan,
+      letterSpacing: '1px'
+    });
+
+    const minBtn = document.createElement('button');
+    minBtn.id = MIN_BTN_ID;
+    minBtn.type = 'button';
+    minBtn.title = 'Minimize';
+    minBtn.textContent = '–';
+
+    header.appendChild(title);
+    header.appendChild(minBtn);
+
+    const body = document.createElement('div');
+
+    const tabRow = document.createElement('div');
+    Object.assign(tabRow.style, {
+      display: 'flex',
+      marginBottom: '14px',
+      borderBottom: `1px solid ${C.border}`
+    });
+
+    const tabBatch = document.createElement('button');
+    tabBatch.id = TAB_BATCH_ID;
+    tabBatch.className = '__gm_tab __gm_tab_active';
+    tabBatch.textContent = 'Same Message';
+    tabBatch.type = 'button';
+
+    const tabPaired = document.createElement('button');
+    tabPaired.id = TAB_PAIRED_ID;
+    tabPaired.className = '__gm_tab';
+    tabPaired.textContent = 'Paired';
+    tabPaired.type = 'button';
+
+    tabRow.appendChild(tabBatch);
+    tabRow.appendChild(tabPaired);
+
+    const inputBase = {
+      width: '100%',
+      background: C.cardBg,
+      color: C.textPrimary,
+      border: `1px solid ${C.border}`,
+      borderRadius: '4px',
+      padding: '8px',
+      boxSizing: 'border-box',
+      fontSize: '10px',
+      fontFamily: T.fontMono,
+      outline: 'none',
+      transition: 'all .2s ease'
+    };
+
+    const labelBase = {
+      marginBottom: '6px',
+      fontSize: '10px',
+      fontFamily: T.fontMono,
+      color: C.cyan,
+      textTransform: 'uppercase',
+      letterSpacing: '0.06em',
+      opacity: '0.85',
+      display: 'block'
+    };
+
+    const viewBatch = document.createElement('div');
+    viewBatch.id = VIEW_BATCH_ID;
+
+    const numsLabel = document.createElement('div');
+    numsLabel.textContent = 'Phone Numbers';
+    Object.assign(numsLabel.style, labelBase);
+
+    const numsBox = document.createElement('textarea');
+    numsBox.id = NUMS_ID;
+    numsBox.className = '__gm_input';
+    numsBox.placeholder = '5597409248\n5597409249\n...';
+    Object.assign(numsBox.style, {
+      ...inputBase,
+      height: '55px',
+      resize: 'vertical'
+    });
+
+    const msgLabel = document.createElement('div');
+    msgLabel.textContent = 'Message Content';
+    Object.assign(msgLabel.style, {
+      ...labelBase,
+      marginTop: '12px'
+    });
+
+    const msgBox = document.createElement('div');
+    msgBox.id = MSG_ID;
+    msgBox.contentEditable = 'true';
+    msgBox.className = '__gm_input';
+    Object.assign(msgBox.style, {
+      ...inputBase,
+      minHeight: '45px',
+      maxHeight: '80px',
+      overflowY: 'auto',
+      whiteSpace: 'pre-wrap',
+      wordWrap: 'break-word'
+    });
+
+    viewBatch.appendChild(numsLabel);
+    viewBatch.appendChild(numsBox);
+    viewBatch.appendChild(msgLabel);
+    viewBatch.appendChild(msgBox);
+
+    const viewPaired = document.createElement('div');
+    viewPaired.id = VIEW_PAIRED_ID;
+    viewPaired.style.display = 'none';
+
+    const pairedLabel = document.createElement('div');
+    pairedLabel.textContent = 'Paste from Sheets';
+    Object.assign(pairedLabel.style, labelBase);
+
+    const pairedBox = document.createElement('textarea');
+    pairedBox.id = PAIRED_ID;
+    pairedBox.className = '__gm_input';
+    Object.assign(pairedBox.style, {
+      ...inputBase,
+      height: '100px',
+      resize: 'vertical',
+      lineHeight: '1.6'
+    });
+
+    const preview = document.createElement('div');
+    preview.id = PREVIEW_ID;
+    preview.textContent = 'Parsed pairs will appear here…';
+
+    pairedBox.addEventListener('input', updatePreview);
+    pairedBox.addEventListener('paste', () => setTimeout(updatePreview, 50));
+
+    viewPaired.appendChild(pairedLabel);
+    viewPaired.appendChild(pairedBox);
+    viewPaired.appendChild(preview);
+
+    const btnRow = document.createElement('div');
+    Object.assign(btnRow.style, {
+      display: 'flex',
+      gap: '8px',
+      marginTop: '14px'
+    });
+
+    const startBtn = document.createElement('button');
+    startBtn.id = START_BTN_ID;
+    startBtn.type = 'button';
+    startBtn.textContent = 'Start Batch';
+    Object.assign(startBtn.style, {
+      flex: '1',
+      padding: '8px 10px',
+      background: C.cyanDim,
+      color: '#fff',
+      border: `1px solid ${C.cyan}`,
+      borderRadius: '4px',
+      cursor: 'pointer',
+      fontFamily: T.fontBody,
+      fontWeight: '600',
+      fontSize: '12px'
+    });
+
+    const stopBtn = document.createElement('button');
+    stopBtn.id = STOP_BTN_ID;
+    stopBtn.type = 'button';
+    stopBtn.textContent = 'Stop';
+    Object.assign(stopBtn.style, {
+      width: '70px',
+      padding: '10px',
+      background: C.pageBg,
+      color: C.textMuted,
+      border: `1px solid ${C.border}`,
+      borderRadius: '4px',
+      cursor: 'pointer',
+      fontFamily: T.fontBody,
+      fontWeight: '600',
+      fontSize: '12px'
+    });
+
+    btnRow.appendChild(startBtn);
+    btnRow.appendChild(stopBtn);
+
+    const statusEl = document.createElement('div');
+    statusEl.id = STATUS_ID;
+    statusEl.textContent = 'Ready';
+    Object.assign(statusEl.style, {
+      marginTop: '12px',
+      color: C.textMuted,
+      minHeight: '18px',
+      fontSize: '11px',
+      padding: '8px 10px',
+      background: C.pageBg,
+      borderRadius: '4px',
+      border: `1px solid ${C.border}`,
+      fontFamily: T.fontMono
+    });
+
+    const failuresBox = document.createElement('div');
+    failuresBox.id = FAILURES_ID;
+
+    body.appendChild(tabRow);
+    body.appendChild(viewBatch);
+    body.appendChild(viewPaired);
+    body.appendChild(btnRow);
+    body.appendChild(statusEl);
+    body.appendChild(failuresBox);
+
+    panel.appendChild(header);
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+
+    const pill = document.createElement('div');
+    pill.id = PILL_ID;
+    pill.setAttribute('role', 'button');
+    pill.setAttribute('tabindex', '0');
+    pill.title = 'Expand Batch Sender';
+
+    const pillDot = document.createElement('div');
+    pillDot.className = '__gm_pill_dot';
+
+    const pillLabel = document.createElement('span');
+    pillLabel.className = '__gm_pill_label';
+    pillLabel.textContent = 'Batch';
+
+    const pillStatusEl = document.createElement('span');
+    pillStatusEl.id = PILL_STATUS_ID;
+    pillStatusEl.textContent = 'Ready';
+
+    pill.appendChild(pillDot);
+    pill.appendChild(pillLabel);
+    pill.appendChild(pillStatusEl);
+    document.body.appendChild(pill);
+
+    if (window.DSP_UI?.makeDraggable) {
+      DSP_UI.makeDraggable(panel, header);
+    } else {
+      let dragging = false;
+      let dx = 0;
+      let dy = 0;
+      let sx = 0;
+      let sy = 0;
+
+      header.style.cursor = 'move';
+
+      header.addEventListener('mousedown', e => {
+        if (e.target.closest('button')) return;
+
+        dragging = true;
+        dx = e.clientX;
+        dy = e.clientY;
+
+        const r = panel.getBoundingClientRect();
+        sx = r.left;
+        sy = r.top;
+
+        panel.style.right = 'auto';
+        panel.style.left = sx + 'px';
+        panel.style.top = sy + 'px';
+
+        e.preventDefault();
+      });
+
+      document.addEventListener('mousemove', e => {
+        if (!dragging) return;
+
+        panel.style.left = Math.max(0, Math.min(innerWidth - panel.offsetWidth, sx + e.clientX - dx)) + 'px';
+        panel.style.top = Math.max(0, Math.min(innerHeight - panel.offsetHeight, sy + e.clientY - dy)) + 'px';
+      });
+
+      document.addEventListener('mouseup', () => {
+        dragging = false;
+      });
+    }
+  }
+
+  function switchTab(mode) {
+    activeMode = mode;
+
+    document.getElementById(TAB_BATCH_ID).classList.toggle('__gm_tab_active', mode === 'batch');
+    document.getElementById(TAB_PAIRED_ID).classList.toggle('__gm_tab_active', mode === 'paired');
+
+    document.getElementById(VIEW_BATCH_ID).style.display = mode === 'batch' ? 'block' : 'none';
+    document.getElementById(VIEW_PAIRED_ID).style.display = mode === 'paired' ? 'block' : 'none';
+  }
+
   function updatePreview() {
     const previewEl = document.getElementById(PREVIEW_ID);
     const pairedBox = document.getElementById(PAIRED_ID);
+
     if (!previewEl || !pairedBox) return;
-    while (previewEl.firstChild) previewEl.removeChild(previewEl.firstChild);
+
+    previewEl.textContent = '';
 
     let pairs = [];
-    try { pairs = parsePairs(pairedBox.value); } catch (e) { /* surface on start */ }
 
-    if (pairs.length === 0) {
-      const empty = document.createElement('span');
-      empty.style.color = T.textMuted;
-      empty.textContent = 'No valid pairs detected yet…';
-      previewEl.appendChild(empty);
+    try {
+      pairs = parsePairs(pairedBox.value);
+    } catch {}
+
+    if (!pairs.length) {
+      previewEl.textContent = 'No valid pairs yet…';
       return;
     }
 
-    const maxShow = 20;
     const hdr = document.createElement('div');
-    Object.assign(hdr.style, { color: T.info, marginBottom: '4px', fontSize: '9px', fontWeight: '600' });
+    Object.assign(hdr.style, {
+      color: C.info,
+      marginBottom: '4px',
+      fontSize: '9px',
+      fontWeight: '600'
+    });
     hdr.textContent = `${pairs.length} pair${pairs.length !== 1 ? 's' : ''} found`;
     previewEl.appendChild(hdr);
 
-    for (const p of pairs.slice(0, maxShow)) {
-      const numDisplay = p.number.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3');
-      const firstLine  = p.message.split('\n')[0];
-      const msgShort   = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
-
+    for (const p of pairs.slice(0, 20)) {
       const row = document.createElement('div');
       row.className = 'pair-row';
 
-      const numSpan = document.createElement('span');
-      numSpan.className   = 'pair-num';
-      numSpan.textContent = numDisplay;
+      const n = document.createElement('span');
+      n.className = 'pair-num';
+      n.textContent = p.number.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3');
 
-      const arrow = document.createElement('span');
-      arrow.className   = 'pair-arrow';
-      arrow.textContent = '→';
+      const a = document.createElement('span');
+      a.className = 'pair-arrow';
+      a.textContent = '→';
 
-      const msgSpan = document.createElement('span');
-      msgSpan.className   = 'pair-msg';
-      msgSpan.textContent = msgShort;
+      const m = document.createElement('span');
+      m.className = 'pair-msg';
+      m.textContent = p.message.split('\n')[0].slice(0, 40);
 
-      row.appendChild(numSpan);
-      row.appendChild(arrow);
-      row.appendChild(msgSpan);
+      row.appendChild(n);
+      row.appendChild(a);
+      row.appendChild(m);
       previewEl.appendChild(row);
     }
 
-    if (pairs.length > maxShow) {
+    if (pairs.length > 20) {
       const more = document.createElement('div');
-      Object.assign(more.style, { color: T.textMuted, marginTop: '2px' });
-      more.textContent = `…and ${pairs.length - maxShow} more`;
+      more.style.color = C.textMuted;
+      more.textContent = `…and ${pairs.length - 20} more`;
       previewEl.appendChild(more);
     }
   }
 
-  /* ---------- Reset to main view ---------- */
-  async function resetToMainView() {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (
-        !composerIsVisible() &&
-        !deepFind(el => el.tagName === 'INPUT' && el.offsetParent !== null &&
-          el.closest('[data-e2e-new-conversation], [role="dialog"]'))
-      ) {
-        await sleep(50);
-        return;
-      }
-      for (const target of [document.activeElement, document.body, document]) {
-        if (!target) continue;
-        target.dispatchEvent(new KeyboardEvent('keydown', {
-          key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true,
-        }));
-      }
-      await sleep(80);
-
-      const closeBtn = deepFind(el =>
-        (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') &&
-        (/back|close|cancel|dismiss/i.test(el.getAttribute('aria-label') || '') ||
-         el.querySelector('[data-mat-icon-name="arrow_back"], [data-mat-icon-name="close"]'))
-      );
-      if (closeBtn) {
-        strongClick(closeBtn);
-        try {
-          await waitFor(() => !composerIsVisible(), { timeout: 2000, interval: 30, label: 'close conversation' });
-          return;
-        } catch { }
-      } else {
-        await sleep(100);
-      }
-    }
-    await sleep(100);
-  }
-
-  /* ---------- Clear and set the number input ---------- */
-  async function clearAndSetInput(input, phone) {
-    input.focus();
-    setVal(input, '');
-    input.select?.();
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', keyCode: 8, bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Backspace', code: 'Backspace', keyCode: 8, bubbles: true }));
-    setVal(input, '');
-    setVal(input, phone);
-
-    try {
-      await waitFor(() =>
-        deepFind(el =>
-          (el.getAttribute('role') === 'listbox' || el.getAttribute('role') === 'option' ||
-           el.classList.contains('autocomplete-list') || el.classList.contains('suggestion')) &&
-          el.offsetParent !== null
-        ), { timeout: 1000, interval: 30, label: 'contact suggestions' }
-      );
-    } catch { await sleep(50); }
-  }
-
-  async function selectContactWithRetry(input, phone, phoneDigits, tag) {
-    const MAX_CONTACT_ATTEMPTS = 3;
-    for (let attempt = 1; attempt <= MAX_CONTACT_ATTEMPTS; attempt++) {
-      setStatus(`${tag} Selecting contact (attempt ${attempt})…`);
-      ['keydown', 'keypress', 'keyup'].forEach(type => {
-        input.dispatchEvent(new KeyboardEvent(type, {
-          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-      });
-
-      const candidatePred = (el) => {
-        const txt      = (el.textContent || '').trim();
-        const aria     = (el.getAttribute('aria-label') || '').trim();
-        const combined = (txt + ' ' + aria).toLowerCase();
-        const hasDigits     = digits(txt).includes(phoneDigits) || digits(aria).includes(phoneDigits);
-        const looksLikeSendTo = /send to/i.test(combined);
-        const isOption        = el.getAttribute('role') === 'option';
-        const isButtonish     = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tagName === 'LI' || el.tagName === 'DIV';
-        return el.offsetParent !== null && isButtonish && (hasDigits || looksLikeSendTo || isOption);
-      };
-
-      let contact = null;
-      try {
-        contact = await waitFor(() => deepFind(candidatePred), { timeout: 1500, interval: 40, label: 'contact dropdown' });
-      } catch { }
-
-      if (contact) {
-        strongClick(contact);
-      } else {
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      }
-
-      try {
-        await waitFor(() => composerIsVisible(), { timeout: 3000, interval: 40, label: 'composer after contact select' });
-        return true;
-      } catch { }
-
-      if (attempt < MAX_CONTACT_ATTEMPTS) {
-        setStatus(`${tag} Conversation didn't open, retrying…`);
-        await resetToMainView();
-        const startBtn = findStartChatButton();
-        if (startBtn) {
-          strongClick(startBtn);
-          try {
-            input = await waitFor(() => findNumberInput(), { timeout: 3000, interval: 40, label: 'number input retry' });
-          } catch { }
-        }
-        await clearAndSetInput(input, phone);
-      }
-    }
-    throw new Error('Could not enter conversation after clicking contact');
-  }
-
-  /* ---------- Pre-extract message content once per batch (batch mode) ---------- */
-  let _cachedText        = null;
-  let _cachedImageBlobs  = null;
-
-  function extractMessageContent() {
-    const richBox = document.getElementById(MSG_ID);
-    let text = '';
-    const walker = document.createTreeWalker(
-      richBox,
-      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
-      { acceptNode: (node) => (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'IMG') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT }
-    );
-    let node; let lastWasBR = false;
-    while ((node = walker.nextNode())) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const content = node.textContent;
-        if (content) { text += content; lastWasBR = false; }
-      } else if (node.nodeType === Node.ELEMENT_NODE) {
-        if (node.tagName === 'BR') {
-          if (!lastWasBR) { text += '\n'; lastWasBR = true; }
-        } else if (node.tagName === 'DIV' || node.tagName === 'P') {
-          if (text && !text.endsWith('\n')) { text += '\n'; }
-          lastWasBR = false;
-        }
-      }
-    }
-    _cachedText = text.trim();
-    const imgs = richBox.querySelectorAll('img');
-    _cachedImageBlobs = null;
-    return imgs.length > 0;
-  }
-
-  async function ensureImageBlobs() {
-    if (_cachedImageBlobs !== null) return _cachedImageBlobs;
-    const richBox  = document.getElementById(MSG_ID);
-    const imgs     = richBox.querySelectorAll('img');
-    const promises = Array.from(imgs).map(async (img) => {
-      try { const res = await fetch(img.src); return await res.blob(); } catch { return null; }
-    });
-    _cachedImageBlobs = (await Promise.all(promises)).filter(Boolean);
-    return _cachedImageBlobs;
-  }
-
-  async function transferContent(composer, textOverride = null) {
-    composer.focus();
-    const textToSend = textOverride !== null ? textOverride : _cachedText;
-    if (textToSend) {
-      composer.focus();
-      composer.select?.();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('delete', false, null);
-      const inserted = document.execCommand('insertText', false, textToSend);
-      if (!inserted || !composer.value) {
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-        if (nativeSetter) nativeSetter.call(composer, textToSend);
-        else composer.value = textToSend;
-        composer.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      await sleep(100);
-    }
-    if (textOverride === null) {
-      const blobs = await ensureImageBlobs();
-      if (blobs && blobs.length > 0) {
-        const dt = new DataTransfer();
-        for (const blob of blobs) { dt.items.add(new File([blob], 'image.png', { type: blob.type })); }
-        const pasteEvent = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
-        composer.dispatchEvent(pasteEvent);
-        try { await waitFor(() => hasAttachment(), { timeout: 3000, interval: 50, label: 'attachment after paste' }); } catch { }
-      }
-    }
-  }
-
-  async function waitForSendConfirmation({ outgoingCountBefore = 0 }) {
-  const deadline = Date.now() + SEND_CONFIRM_TIMEOUTMS;
-
-  // Step 1: wait for new outgoing bubble to appear
-  let newestBubble = null;
-  await waitFor(
-    () => {
-      if (stopRequested) throw new Error('Stopped');
-      const bubbles = document.querySelectorAll('[data-e2e-message-outgoing]');
-      if (bubbles.length <= outgoingCountBefore) return false;
-      newestBubble = bubbles[bubbles.length - 1];
-      return true;
-    },
-    { timeout: SEND_CONFIRM_TIMEOUTMS, interval: 80, label: 'new outgoing bubble' }
-  );
-
-  // Step 2: wait for aria-label on mws-text-message-part to confirm sent/delivered
-  await waitFor(
-    () => {
-      if (stopRequested) throw new Error('Stopped');
-      const part = newestBubble?.querySelector('mws-text-message-part');
-      const label = part?.getAttribute('aria-label') || '';
-      return /Sent on|Delivered/i.test(label);
-    },
-    { timeout: 30000, interval: 200, label: 'sent/delivered confirmation' }
-  );
-
-  return true;
-}
-
-  /* ---------- Main per-number flow ---------- */
-  async function prepAndWaitSend(phone, index, total, textOverride = null) {
-    const tag         = `[${index + 1}/${total}]`;
-    const phoneDigits = digits(phone);
-    _deepFindCache.delete('composer');
-    _deepFindCache.delete('sendBtn');
-    _deepFindCache.delete('startChat');
-
-    await resetToMainView();
-
-    setStatus(`${tag} Opening chat…`);
-    const startBtn = await waitFor(() => findStartChatButton(), { timeout: 5000, interval: 50, label: 'start chat button' });
-    strongClick(startBtn);
-
-    setStatus(`${tag} Waiting for input…`);
-    const input = await waitFor(() => findNumberInput(), { timeout: 3000, interval: 30, label: 'number input' });
-
-    setStatus(`${tag} Entering number…`);
-    await clearAndSetInput(input, phone);
-    await selectContactWithRetry(input, phone, phoneDigits, tag);
-
-    setStatus(`${tag} Finding composer…`);
-    const composer = await waitFor(() => cachedDeepFind('composer', isComposerTextarea), { timeout: 3000, interval: 30, label: 'composer' });
-
-    composer.focus();
-
-    setStatus(`${tag} Pasting content…`);
-    await transferContent(composer, textOverride);
-
-    const sendBtn = await waitFor(() => cachedDeepFind('sendBtn', isSendButton), { timeout: 3000, interval: 30, label: 'send button' });
-    sendBtn.style.outline       = `3px solid ${T.cyan}`;
-    sendBtn.style.outlineOffset = '2px';
-    sendBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-    setStatus(`${tag} Click Send. Waiting for confirmation…`);
-
-    const outgoingCountBefore = document.querySelectorAll('[data-e2e-message-outgoing]').length;
-
-    setNextButtonEnabled(false);
-    updatePillIndicator();
-
-    const confirmed = await waitForSendConfirmation({ outgoingCountBefore });
-    waitingForNext = false;
-    sendBtn.style.outline       = '';
-    sendBtn.style.outlineOffset = '';
-
-    if (!confirmed) throw new Error('Send timed out — could not confirm send. Will retry.');
-    await sleep(300);
-    setStatus(`${tag} Confirmed sent, moving on…`);
-  }
-
-  async function attemptSendWithRetries({ number, message, index, total, modeLabel }) {
-    let lastErr = null;
-    for (let attempt = 1; attempt <= MAX_TRIES_PER_NUMBER; attempt++) {
-      if (stopRequested) throw new Error('Stopped');
-      try {
-        setStatus(`[${index + 1}/${total}] ${modeLabel} attempt ${attempt}/${MAX_TRIES_PER_NUMBER}…`);
-        await prepAndWaitSend(number, index, total, message);
-        return { ok: true };
-      } catch (e) {
-        lastErr = e;
-        console.error('[BatchSender] attempt failed', attempt, number, e);
-        waitingForNext = false;
-        setNextButtonEnabled(false);
-        updatePillIndicator();
-        await resetToMainView();
-        await sleep(500);
-      }
-    }
-    return { ok: false, error: lastErr?.message || 'Unknown error' };
-  }
-
-  async function retryFailuresPostRun(failed, runnerName) {
-    if (!failed.length || stopRequested) return failed;
-    let remaining = failed.slice();
-    for (let pass = 1; pass <= MAX_POST_RUN_PASSES; pass++) {
-      if (!remaining.length || stopRequested) break;
-      setStatus(`${runnerName}: Retrying failures (pass ${pass}/${MAX_POST_RUN_PASSES})…`);
-
-      const nextRemaining = [];
-      for (let i = 0; i < remaining.length; i++) {
-        if (stopRequested) break;
-        const item = remaining[i];
-
-        const sigText = item.message !== null ? item.message : item.capturedText;
-        const sig = getSignature(item.number, sigText);
-        if (sessionSentRegistry.has(sig)) continue;
-
-        const result = await attemptSendWithRetries({
-          number:    item.number,
-          message:   item.message ?? null,
-          index:     i,
-          total:     remaining.length,
-          modeLabel: 'Retry',
-        });
-
-        if (result.ok) {
-          sessionSentRegistry.add(sig);
-        } else {
-          nextRemaining.push({ ...item, error: result.error });
-        }
-      }
-      remaining = nextRemaining.slice();
-    }
-    return remaining;
-  }
-
-  /* ---------- Batch runner (same message) ---------- */
-  async function runBatch(numbers) {
-    stopRequested  = false;
-    waitingForNext = false;
-    toggleRunState(true);
-    showFailuresInUI([]);
-
-    const hasImages = extractMessageContent();
-    if (hasImages) { setStatus('Pre-loading images…'); await ensureImageBlobs(); }
-
-    const batchTextSnapshot = _cachedText;
-
-    let successCount = 0; let failCount = 0; let skipCount = 0;
-    const failed = [];
-
-    for (let i = 0; i < numbers.length; i++) {
-      if (stopRequested) { setStatus('Stopped.'); break; }
-      const num    = numbers[i];
-      const msgSig = getSignature(num, batchTextSnapshot);
-
-      if (sessionSentRegistry.has(msgSig)) {
-        skipCount++;
-        setStatus(`[${i + 1}/${numbers.length}] Skipping ${num} (already sent this session).`);
-        continue;
-      }
-
-      const result = await attemptSendWithRetries({
-        number:    num,
-        message:   null,
-        index:     i,
-        total:     numbers.length,
-        modeLabel: 'Batch',
-      });
-
-      if (result.ok) {
-        sessionSentRegistry.add(msgSig);
-        successCount++;
-      } else {
-        failCount++;
-        failed.push({ number: num, message: null, capturedText: batchTextSnapshot, error: result.error });
-        setStatus(`Error on ${num}: ${result.error}`);
-      }
-    }
-
-    if (!stopRequested && failed.length) {
-      setStatus(`Initial run done. Retrying ${failed.length} failed…`);
-      const remaining = await retryFailuresPostRun(failed, 'Batch');
-      successCount += (failed.length - remaining.length);
-      failCount     = remaining.length;
-      if (remaining.length) showFailuresInUI(remaining);
-    }
-
-    const parts = [`${successCount} sent`, `${failCount} failed`];
-    if (skipCount) parts.push(`${skipCount} skipped (duplicate)`);
-    setStatus(`Done. ${parts.join(', ')}.`);
-    toggleRunState(false);
-  }
-
-  /* ---------- Paired runner (unique message per number) ---------- */
-  async function runPaired(pairs) {
-    stopRequested  = false;
-    waitingForNext = false;
-    toggleRunState(true);
-    showFailuresInUI([]);
-
-    _cachedText = null; _cachedImageBlobs = [];
-    let successCount = 0; let failCount = 0; let skipCount = 0;
-    const failedPairs = [];
-
-    for (let i = 0; i < pairs.length; i++) {
-      if (stopRequested) { setStatus('Stopped.'); break; }
-      const { number, message } = pairs[i];
-      const nameMatch = message.match(/^Hey\s+(\w+)/i);
-      const nameTag   = nameMatch ? nameMatch[1] : number;
-      const msgSig    = getSignature(number, message);
-
-      if (sessionSentRegistry.has(msgSig)) {
-        skipCount++;
-        setStatus(`[${i + 1}/${pairs.length}] Skipping ${nameTag} (already sent this session).`);
-        continue;
-      }
-
-      const result = await attemptSendWithRetries({
-        number,
-        message,
-        index:     i,
-        total:     pairs.length,
-        modeLabel: 'Paired',
-      });
-
-      if (result.ok) {
-        sessionSentRegistry.add(msgSig);
-        successCount++;
-        setStatus(`[${i + 1}/${pairs.length}] ✓ Sent to ${nameTag}`);
-      } else {
-        failCount++;
-        failedPairs.push({ index: i + 1, name: nameTag, number, message, capturedText: message, error: result.error });
-        setStatus(`[${i + 1}/${pairs.length}] ✗ FAILED: ${nameTag} — ${result.error}`);
-      }
-    }
-
-    if (!stopRequested && failedPairs.length) {
-      setStatus(`Initial run done. Retrying ${failedPairs.length} failed…`);
-      const remaining = await retryFailuresPostRun(
-        failedPairs.map(f => ({ number: f.number, message: f.message, capturedText: f.capturedText, name: f.name, index: f.index, error: f.error })),
-        'Paired'
-      );
-      successCount += (failedPairs.length - remaining.length);
-      failCount     = remaining.length;
-      if (remaining.length) showFailuresInUI(remaining);
-    }
-
-    const parts = [`${successCount} sent`, `${failCount} failed`];
-    if (skipCount) parts.push(`${skipCount} skipped (duplicate)`);
-    setStatus(`Done. ${parts.join(', ')}.`);
-    toggleRunState(false);
-  }
-
-  /* ---------- Wire UI ---------- */
   function wireUI() {
-    const startBtn  = document.getElementById(START_BTN_ID);
-    const stopBtn   = document.getElementById(STOP_BTN_ID);
-    const nextBtn   = document.getElementById(NEXT_BTN_ID);
-    const numsBox   = document.getElementById(NUMS_ID);
-    const msgBox    = document.getElementById(MSG_ID);
-    const pairedBox = document.getElementById(PAIRED_ID);
-    const tabBatch  = document.getElementById(TAB_BATCH_ID);
-    const tabPaired = document.getElementById(TAB_PAIRED_ID);
-    const minBtn    = document.getElementById(MIN_BTN_ID);
-    const pill      = document.getElementById(PILL_ID);
+    document.getElementById(TAB_BATCH_ID).addEventListener('click', () => switchTab('batch'));
+    document.getElementById(TAB_PAIRED_ID).addEventListener('click', () => switchTab('paired'));
 
-    tabBatch.addEventListener('click',  () => switchTab('batch'));
-    tabPaired.addEventListener('click', () => switchTab('paired'));
+    document.getElementById(MIN_BTN_ID).addEventListener('click', () => setMinimized(true));
+    document.getElementById(PILL_ID).addEventListener('click', () => setMinimized(false));
 
-    minBtn.addEventListener('click', () => setMinimized(true));
-    pill.addEventListener('click',   () => setMinimized(false));
-    pill.addEventListener('keydown',  (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMinimized(false); }
+    document.getElementById(PILL_ID).addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        setMinimized(false);
+      }
     });
 
-    startBtn.addEventListener('click', () => {
+    document.getElementById(START_BTN_ID).addEventListener('click', () => {
       if (isRunning) return;
 
       if (activeMode === 'batch') {
-        const nums = parseNumbers(numsBox.value);
-        if (!nums.length) return setStatus('Add at least one valid number (7+ digits).');
-        if (!msgBox.innerText.trim() && !msgBox.querySelector('img')) return setStatus('Add content.');
-        setStatus('Starting batch…');
+        const nums = parseNumbers(document.getElementById(NUMS_ID).value);
+        const msgBox = document.getElementById(MSG_ID);
+
+        if (!nums.length) return setStatus('Add at least one valid number.');
+        if (!msgBox.innerText.trim() && !msgBox.querySelector('img')) return setStatus('Add message content.');
+
         runBatch(nums);
       } else {
         let pairs;
+
         try {
-          pairs = parsePairs(pairedBox.value);
+          pairs = parsePairs(document.getElementById(PAIRED_ID).value);
         } catch (e) {
           return setStatus(`Parse error: ${e.message}`);
         }
-        if (!pairs.length) return setStatus('No valid pairs found. Check your paste or format.');
-        setStatus(`Starting paired send (${pairs.length} pairs)…`);
+
+        if (!pairs.length) return setStatus('No valid pairs found.');
+
         runPaired(pairs);
       }
     });
 
-    stopBtn.addEventListener('click', () => {
-      if (!isRunning && !waitingForNext) return;
-      stopRequested  = true;
-      waitingForNext = false;
-      setNextButtonEnabled(false);
-      setStatus('Stop requested…');
+    document.getElementById(STOP_BTN_ID).addEventListener('click', () => {
+      if (!isRunning) return;
+
+      stopRequested = true;
+      setStatus('Stopping…');
       toggleRunState(false);
     });
-
-    nextBtn.addEventListener('click', () => {
-      if (nextBtn.disabled) return;
-      if (!waitingForNext) return;
-      waitingForNext = false;
-      setNextButtonEnabled(false);
-      updatePillIndicator();
-      setStatus('Continuing…');
-    });
   }
 
-  function init() {
-    addPanel();
-    wireUI();
-  }
-
-  init();
+  addPanel();
+  wireUI();
 })();
