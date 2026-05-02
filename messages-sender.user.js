@@ -2,7 +2,7 @@
 // @name         Messages Sender
 // @namespace    http://tampermonkey.net/
 // @version      6.2
-// @description  Batch-prep chats. v6.2: persistent 24hr no-double-send registry + avlg-bot shared UI.
+// @description  Batch-prep chats. v6.2: persistent 24hr no-double-send registry + onth-bot shared UI.
 // @author       You
 // @match        https://messages.google.com/*
 // @require      https://cdn.jsdelivr.net/gh/onth-bot/dsp-shared-ui@main/dsp-ui-core.js
@@ -129,15 +129,14 @@
     }
   };
 
+  // Modified to wait indefinitely instead of timing out
   async function waitFor(fn, { timeout = 8000, interval = 50, label = '' } = {}) {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
+    while (true) {
       if (stopRequested) throw new Error('Stopped');
       const r = fn();
       if (r) return r;
       await sleep(interval);
     }
-    throw new Error(`waitFor timeout: ${label}`);
   }
 
   const onNewPage = () => location.pathname.endsWith('/new');
@@ -420,12 +419,12 @@
 
     setStatus(`${tag} ✋ Click Send when ready…`);
 
-    const sendDeadline = Date.now() + 300000;
     let messageSent = false;
 
     await sleep(150);
 
-    while (Date.now() < sendDeadline) {
+    // Modified to wait indefinitely for the message to send
+    while (true) {
       if (stopRequested) throw new Error('Stopped');
 
       const currentBtn = document.querySelector('[data-e2e-send-text-button]');
@@ -439,8 +438,6 @@
 
     sendBtn.style.outline = '';
     sendBtn.style.outlineOffset = '';
-
-    if (!messageSent) throw new Error('Send timed out');
 
     setStatus(`${tag} ✓ Sent`);
     await sleep(300);
